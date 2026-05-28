@@ -96,7 +96,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleName</key><string>Video Tiler</string>
   <key>CFBundleDisplayName</key><string>Video Tiler</string>
   <key>CFBundleIdentifier</key><string>com.suprememastertv.videotiler</string>
-  <key>CFBundleVersion</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>video-tiler</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>

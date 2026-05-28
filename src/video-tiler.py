@@ -17,10 +17,12 @@ import json
 import time
 import queue
 import shutil
+import logging
 import threading
 import subprocess
 import webbrowser
 import urllib.request
+from logging.handlers import RotatingFileHandler
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -77,6 +79,14 @@ RUN_VALUE_NAME = "SMTV_VideoTiler"
 
 APP_DATA_DIR = None
 SETTINGS_FILE = None
+LOG_FILE = None
+
+# On Windows, keep helper processes (yt-dlp / ffmpeg / ffplay) from flashing a
+# console window - important for an unattended kiosk. No effect on other OSes.
+CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
+log = logging.getLogger(APP_NAME)
+log.addHandler(logging.NullHandler())
 
 
 # --------------------------------------------------------------------------- #
@@ -108,7 +118,7 @@ def find_executable(name):
 #  Settings persistence (single JSON; remembers every GUI choice)
 # --------------------------------------------------------------------------- #
 def _init_paths():
-    global APP_DATA_DIR, SETTINGS_FILE
+    global APP_DATA_DIR, SETTINGS_FILE, LOG_FILE
     try:
         import appdirs
         APP_DATA_DIR = appdirs.user_data_dir(APP_NAME)
@@ -116,6 +126,25 @@ def _init_paths():
         APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".videotiler")
     os.makedirs(APP_DATA_DIR, exist_ok=True)
     SETTINGS_FILE = os.path.join(APP_DATA_DIR, 'settings.json')
+    LOG_FILE = os.path.join(APP_DATA_DIR, 'videotiler.log')
+    _init_logging()
+
+
+def _init_logging():
+    """A small rotating log in the data dir - the only window into what an
+    unattended kiosk did when no console is attached (windowed/frozen builds)."""
+    if any(isinstance(h, RotatingFileHandler) for h in log.handlers):
+        return
+    log.setLevel(logging.INFO)
+    try:
+        handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding='utf-8')
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)-7s %(message)s', '%Y-%m-%d %H:%M:%S'))
+        log.addHandler(handler)
+    except Exception:
+        pass
+    log.info("=== Video Tiler %s starting (pid %s) ===", PROGRAM_VERSION, os.getpid())
 
 
 def read_settings():
@@ -143,10 +172,16 @@ def write_settings(data):
 # --------------------------------------------------------------------------- #
 def _startup_command():
     """Command Windows runs at login - the current interpreter/exe, so the
-    startup launch keeps the same working environment (venv or frozen build)."""
+    startup launch keeps the same working environment (venv or frozen build).
+    Prefers pythonw.exe over python.exe so the kiosk does not flash a console
+    window at every login."""
     if getattr(sys, 'frozen', False):
         return '"{}"'.format(sys.executable)
-    return '"{}" "{}"'.format(sys.executable, os.path.abspath(__file__))
+    interpreter = sys.executable
+    pythonw = os.path.join(os.path.dirname(interpreter), 'pythonw.exe')
+    if os.path.isfile(pythonw):
+        interpreter = pythonw
+    return '"{}" "{}"'.format(interpreter, os.path.abspath(__file__))
 
 
 def set_run_at_startup(enabled):
@@ -169,7 +204,7 @@ def set_run_at_startup(enabled):
             winreg.CloseKey(key)
         return True
     except Exception as e:
-        print("run-at-startup change failed:", e)
+        log.warning("run-at-startup change failed: %s", e)
         return False
 
 
@@ -253,11 +288,9 @@ class Player:
 
     # ---- command building ------------------------------------------------- #
     def _yt_dlp_cmd(self):
-        quality = 'Auto'
-        try:
-            quality = self.app.quality.get()
-        except Exception:
-            pass
+        # Plain-attribute mirrors (set on the main thread) - workers must never
+        # read Tk variables directly. See App._sync_runtime_options.
+        quality = getattr(self.app, 'opt_quality', 'Auto')
         return [
             self.yt_dlp_path, self.url,
             '--extractor-args', 'youtube:player_client=' + YT_PLAYER_CLIENTS,
@@ -269,11 +302,8 @@ class Player:
 
     def _targets(self):
         monitors = monitor_utils.list_monitors()
-        try:
-            multi = bool(self.app.multi_monitor.get())
-            selected = list(self.app.selected_monitor_indices)
-        except Exception:
-            multi, selected = False, []
+        multi = bool(getattr(self.app, 'opt_multi_monitor', False))
+        selected = list(getattr(self.app, 'selected_monitor_indices', []))
         return monitor_utils.select_monitors(monitors, selected, multi), multi
 
     def _ffplay_cmd(self, mon, multi, muted):
@@ -287,19 +317,20 @@ class Player:
     def _start(self):
         self._terminate()
         self.ytdlp_process = subprocess.Popen(
-            self._yt_dlp_cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._yt_dlp_cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW)
 
         targets, multi = self._targets()
-        try:
-            muted = bool(self.app.mute.get())
-        except Exception:
-            muted = False
+        muted = bool(getattr(self.app, 'opt_mute', False))
+        log.info("start: url=%s divisions=%d windows=%d multi=%s muted=%s",
+                 self.url, self.divisions, len(targets), multi, muted)
 
         if len(targets) <= 1:
             # Single window reads the download directly.
             proc = subprocess.Popen(
                 self._ffplay_cmd(targets[0], multi, muted),
-                stdin=self.ytdlp_process.stdout, stderr=subprocess.DEVNULL)
+                stdin=self.ytdlp_process.stdout, stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW)
             self.ffplay_processes = [proc]
         else:
             # One window per monitor; fan the single download out to all of them.
@@ -309,7 +340,8 @@ class Player:
             for i, mon in enumerate(targets):
                 proc = subprocess.Popen(
                     self._ffplay_cmd(mon, multi, muted or i > 0),
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW)
                 self.ffplay_processes.append(proc)
                 stdins.append(proc.stdin)
             self._fanout_thread = threading.Thread(
@@ -344,9 +376,15 @@ class Player:
                     pass
 
     def _alive(self):
+        # Require the download AND every player window to be alive. Using "all"
+        # (not "any") means a single dead monitor in a multi-screen wall is
+        # detected and triggers a clean relaunch, instead of leaving that screen
+        # black while the others keep playing.
         if not self.ytdlp_process or self.ytdlp_process.poll() is not None:
             return False
-        return any(p.poll() is None for p in self.ffplay_processes)
+        if not self.ffplay_processes:
+            return False
+        return all(p.poll() is None for p in self.ffplay_processes)
 
     def _terminate(self):
         for p in self.ffplay_processes:
@@ -377,15 +415,18 @@ class Player:
                 # A good long session: forget past failures.
                 backoff, self._fail_count, self._healed = 3, 0, False
 
-            if not self.app.auto_restart_video.get():
-                self.app.post_ui(lambda: self.app.update_status("Stopped."))
+            if not getattr(self.app, 'opt_auto_restart', True):
+                log.info("playback ended (ran %.0fs); auto-restart off -> stop", ran_for)
                 break
 
             # Self-heal: repeated quick failures usually mean YouTube changed
             # something, so update yt-dlp once (its maintainers ship the fix).
             self._fail_count += 1
+            log.info("playback dropped after %.0fs (failure #%d); backoff %ds",
+                     ran_for, self._fail_count, backoff)
             if self._fail_count >= self.HEAL_AFTER_FAILS and not self._healed:
                 self._healed = True
+                log.info("self-heal: updating yt-dlp after repeated failures")
                 self.app.update_yt_dlp(silent=True)
 
             self.app.post_ui(lambda b=backoff: self.app.update_status(
@@ -397,9 +438,11 @@ class Player:
             backoff = min(backoff * 2, 30)  # exponential, capped
 
         self._terminate()
-        self.app.post_ui(lambda: self.app.play_button.config(state=tk.NORMAL))
+        self.app.post_ui(lambda: self.app._on_player_finished(self))
 
     def stop(self):
+        if self.play_flag:
+            log.info("stop requested")
         self.play_flag = False
         self._terminate()
 
@@ -428,6 +471,15 @@ class App(tk.Tk):
         self.play_flag = False
         self.theme_var = tk.StringVar(value='Light')
         self.selected_monitor_indices = [m['index'] for m in monitor_utils.list_monitors()]
+        self._last_title_url = None
+
+        # Plain-attribute mirrors of the GUI options. Worker threads read THESE
+        # (never the Tk variables, which are not thread-safe). Kept in sync on
+        # the main thread by _sync_runtime_options.
+        self.opt_auto_restart = True
+        self.opt_multi_monitor = False
+        self.opt_mute = False
+        self.opt_quality = 'Auto'
 
         # Thread-safe GUI updates: workers put callables here; the main loop drains.
         self._ui_queue = queue.Queue()
@@ -637,7 +689,19 @@ class App(tk.Tk):
             pass
 
     # ---- settings --------------------------------------------------------- #
+    def _sync_runtime_options(self):
+        """Copy the GUI options into plain attributes that worker threads may
+        read safely. MUST be called on the main thread (it touches Tk vars)."""
+        try:
+            self.opt_auto_restart = bool(self.auto_restart_video.get())
+            self.opt_multi_monitor = bool(self.multi_monitor.get())
+            self.opt_mute = bool(self.mute.get())
+            self.opt_quality = self.quality.get()
+        except Exception:
+            pass
+
     def save_all_settings(self):
+        self._sync_runtime_options()
         try:
             url = self.url_entry.get().strip()
             urls = list(self.url_entry['values'])
@@ -646,7 +710,7 @@ class App(tk.Tk):
                 self.url_entry['values'] = urls
             write_settings({
                 'url': url, 'urls': urls,
-                'divisions': int(self.divisions_spinbox.get()),
+                'divisions': self._safe_divisions(),
                 'auto_restart': bool(self.auto_restart_video.get()),
                 'multi_monitor': bool(self.multi_monitor.get()),
                 'selected_monitor_indices': list(self.selected_monitor_indices),
@@ -656,8 +720,8 @@ class App(tk.Tk):
                 'run_at_startup': bool(self.run_at_startup.get()),
                 'theme': self.theme_var.get(),
             })
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("save settings failed: %s", e)
         self.refresh_monitor_info()
 
     def load_all_settings(self):
@@ -686,8 +750,9 @@ class App(tk.Tk):
                 self.apply_theme()
             if data.get('url'):
                 self.url_entry.set(data['url'])
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("load settings failed: %s", e)
+        self._sync_runtime_options()
         self.refresh_monitor_info()
 
     def on_toggle_startup(self):
@@ -753,7 +818,8 @@ class App(tk.Tk):
                 return
             try:
                 self.post_ui(lambda: self.update_status("Updating yt-dlp...", color='#b06a00'))
-                res = subprocess.run([path, '-U'], capture_output=True, text=True, timeout=180)
+                res = subprocess.run([path, '-U'], capture_output=True, text=True,
+                                     timeout=180, creationflags=CREATE_NO_WINDOW)
                 out = ((res.stdout or '') + (res.stderr or '')).strip()
                 self.post_ui(lambda: self.update_status("yt-dlp update finished."))
                 if not silent:
@@ -801,10 +867,15 @@ class App(tk.Tk):
             pass
         self.stop_video() if self.play_flag else self.play_video()
 
-    def update_video_title(self):
+    def update_video_title(self, force=False):
         url = self.url_entry.get().strip()
         if not url:
             return
+        # Debounce: <FocusOut> fires often, so skip a refetch when the URL has
+        # not changed since the last fetch we kicked off.
+        if not force and url == self._last_title_url:
+            return
+        self._last_title_url = url
         probe = Player(self, url, self._safe_divisions())
         probe.fetch_title_async(lambda t: self.video_title_label.config(text=t))
 
@@ -821,9 +892,10 @@ class App(tk.Tk):
             messagebox.showerror("URL", "Please enter a video URL.")
             return
         divisions = self._safe_divisions()
-        self.save_all_settings()
+        self.save_all_settings()  # also syncs the runtime-option mirrors
         self.player = Player(self, url, divisions)
         if not self.player.tools_ok:
+            self.player = None
             messagebox.showerror("Missing tools",
                                  "yt-dlp, ffmpeg and ffplay must be on PATH (or next to the app).")
             return
@@ -841,6 +913,16 @@ class App(tk.Tk):
         self.play_button.config(state=tk.NORMAL)
         self.update_status("Ready")
 
+    def _on_player_finished(self, player):
+        """Called on the main thread when a Player's run() loop exits. Only the
+        currently-active player may flip the UI back, so a stale old player
+        (already replaced by a new Play) can't re-enable the button mid-playback."""
+        if player is not self.player:
+            return
+        self.play_flag = False
+        self.play_button.config(state=tk.NORMAL)
+        self.update_status("Stopped.")
+
     def show_help(self):
         messagebox.showinfo("Help", (
             "HOW TO USE\n"
@@ -855,7 +937,7 @@ class App(tk.Tk):
             "  Tick 'Multi-monitor' and use 'Monitors...' to choose screens (e.g. 2\n"
             "  of 3). One download is fanned out to one window per screen.\n\n"
             "KEYBOARD\n"
-            "  Esc = Stop    F5 = Play    Space = Play/Pause\n\n"
+            "  Esc = Stop    F5 = Play    Space = Play / Stop\n\n"
             "OPTIONS\n"
             "  Quality forces a resolution (Auto picks by tile count). Auto-play and\n"
             "  Run-at-startup enable kiosk mode. Theme (View menu) and every choice\n"
