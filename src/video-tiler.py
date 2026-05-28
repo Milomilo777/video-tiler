@@ -156,10 +156,16 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "SMTV_VideoTiler"
 
 
-def _startup_launcher_path():
-    """Absolute path to the launcher .bat that startup should run."""
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(repo_root, "run.bat")
+def _startup_command():
+    """Command Windows should run at login to start this app.
+
+    Uses the *currently running* interpreter/executable so the startup launch
+    has the same working environment (venv or frozen build) - launching a bare
+    'python' could miss the installed dependencies.
+    """
+    if getattr(sys, 'frozen', False):
+        return '"{}"'.format(sys.executable)
+    return '"{}" "{}"'.format(sys.executable, os.path.abspath(__file__))
 
 
 def set_run_at_startup(enabled):
@@ -169,8 +175,7 @@ def set_run_at_startup(enabled):
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
         try:
             if enabled:
-                cmd = '"{}"'.format(_startup_launcher_path())
-                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
             else:
                 try:
                     winreg.DeleteValue(key, RUN_VALUE_NAME)
@@ -504,6 +509,7 @@ class YouTubeVideo:
                 for s in list(stdins):
                     try:
                         s.write(chunk)
+                        s.flush()
                     except (BrokenPipeError, OSError, ValueError):
                         try:
                             stdins.remove(s)
@@ -539,6 +545,14 @@ class YouTubeVideo:
 
         targets = monitor_utils.select_monitors(monitors, selected, multi)
         base_flags = ['-autoexit', '-loglevel', 'error', '-hide_banner']
+
+        # Kill any players left over from a previous attempt so they can't linger
+        # as orphan windows (e.g. after a partial failure on one monitor).
+        for p in (self.ffplay_processes or []):
+            try:
+                p.kill()
+            except Exception:
+                pass
         self.ffplay_processes = []
 
         if len(targets) <= 1:
@@ -900,9 +914,10 @@ class App(tk.Tk):
         self.apply_theme()
 
     def _space_shortcut(self, event=None):
-        # Don't hijack the spacebar while the user is typing in the URL box
+        # Don't hijack the spacebar while the user is in any text input field
         try:
-            if self.focus_get() is self.url_entry:
+            w = self.focus_get()
+            if w is not None and w.winfo_class() in ('Entry', 'TEntry', 'TCombobox', 'Spinbox'):
                 return
         except Exception:
             pass
