@@ -16,6 +16,8 @@ import time
 import appdirs
 import pygetwindow as gw
 import win32process
+import json
+import monitor_utils
 
 
 # Left to do:
@@ -108,6 +110,90 @@ def write_divisions(divisions):
     with open(DIVISIONS_FILE, 'w') as file:
         file.write(str(divisions))
 
+
+# Single JSON file that remembers every GUI choice between launches.
+SETTINGS_FILE = os.path.join(app_data_dir, 'settings.json')
+
+DEFAULT_SETTINGS = {
+    'url': DEFAULT_URL,
+    'urls': [DEFAULT_URL, "https://x.com/i/broadcasts/1LyxBgjebwOKN"],
+    'divisions': 3,
+    'auto_restart': True,
+    'multi_monitor': False,
+    'selected_monitor_indices': [],
+    'mute': False,
+    'quality': 'Auto',
+    'autoplay': False,
+    'run_at_startup': False,
+}
+
+QUALITY_CHOICES = ['Auto', '1080p', '720p', '480p', '360p', '240p', '144p']
+
+
+def quality_to_format(quality):
+    """Translate a quality label into a yt-dlp -f selector, or None for Auto."""
+    heights = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240, '144p': 144}
+    h = heights.get(quality)
+    if not h:
+        return None
+    return "best[height<={h}]/best[height<={h2}]/best".format(h=h, h2=h + 120)
+
+
+# ---- Optional "run at Windows startup" support (per-user, reversible) ----
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "SMTV_VideoTiler"
+
+
+def _startup_launcher_path():
+    """Absolute path to the launcher .bat that startup should run."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, "RUN - test the github version.bat")
+
+
+def set_run_at_startup(enabled):
+    """Add or remove this app from the current user's Windows startup. Returns True on success."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if enabled:
+                cmd = '"{}"'.format(_startup_launcher_path())
+                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+            else:
+                try:
+                    winreg.DeleteValue(key, RUN_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        print("run-at-startup change failed: {}".format(e))
+        return False
+
+
+def read_settings():
+    """Load persisted settings, merged over the defaults."""
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            data.update(saved)
+    except Exception:
+        pass
+    return data
+
+
+def write_settings(data):
+    """Persist the given settings dict (best effort)."""
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 class TimerWindow:
     def __init__(self, parent, title, question, duration):
         self.parent = tk.Toplevel(parent)  # Create a separate window
@@ -183,6 +269,8 @@ class YouTubeVideo:
         self.ffmpeg_path = find_executable('ffmpeg')
         self.ffplay_path = find_executable('ffplay')
         self.play_flag = None
+        self.ffplay_processes = []   # one ffplay per active monitor
+        self._fanout_thread = None
 
         if not self.yt_dlp_path or not self.ffmpeg_path or not self.ffplay_path:
             raise FileNotFoundError("One or more required executables (yt-dlp, ffmpeg, ffplay) not found.")
@@ -388,6 +476,80 @@ class YouTubeVideo:
 
 
 
+    def _fanout(self, source, stdins):
+        """Copy the single download to every ffplay stdin (multi-monitor mode)."""
+        try:
+            while True:
+                chunk = source.read(65536)
+                if not chunk:
+                    break
+                for s in list(stdins):
+                    try:
+                        s.write(chunk)
+                    except (BrokenPipeError, OSError, ValueError):
+                        try:
+                            stdins.remove(s)
+                        except ValueError:
+                            pass
+                if not stdins:
+                    break
+        except Exception:
+            pass
+        finally:
+            for s in list(stdins):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def _launch_players(self):
+        """Start one ffplay per active monitor, fed by the single yt-dlp download.
+
+        - One monitor  -> ffplay reads the download directly.
+        - Many monitors -> a fan-out thread copies the download to every ffplay,
+          so there is still only ONE network download.
+        Only the first window keeps audio; the rest are muted to avoid echo.
+        """
+        try:
+            monitors = monitor_utils.list_monitors()
+            multi = bool(self.parent.multi_monitor.get())
+            selected = list(self.parent.selected_monitor_indices)
+            mute = bool(self.parent.mute.get())
+        except Exception:
+            monitors = monitor_utils.list_monitors()
+            multi, selected, mute = False, [], False
+
+        targets = monitor_utils.select_monitors(monitors, selected, multi)
+        base_flags = ['-autoexit', '-loglevel', 'error', '-hide_banner']
+        self.ffplay_processes = []
+
+        if len(targets) <= 1:
+            mon = targets[0]
+            vf, ow, oh = monitor_utils.tile_filter_for(mon['width'], mon['height'], self.divisions)
+            win = monitor_utils.window_opts_for(mon, ow, oh) if multi else ['-fs']
+            audio = ['-an'] if mute else []
+            cmd = [self.ffplay_path, '-', '-vf', vf] + base_flags + audio + win
+            print(cmd)
+            proc = subprocess.Popen(cmd, stdin=self.ytdlp_process.stdout, stderr=subprocess.PIPE)
+            self.ffplay_processes.append(proc)
+        else:
+            stdins = []
+            for i, mon in enumerate(targets):
+                vf, ow, oh = monitor_utils.tile_filter_for(mon['width'], mon['height'], self.divisions)
+                win = monitor_utils.window_opts_for(mon, ow, oh)
+                audio = [] if (i == 0 and not mute) else ['-an']
+                cmd = [self.ffplay_path, '-', '-vf', vf] + base_flags + audio + win
+                print(cmd)
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.ffplay_processes.append(proc)
+                stdins.append(proc.stdin)
+            self._fanout_thread = threading.Thread(
+                target=self._fanout, args=(self.ytdlp_process.stdout, stdins), daemon=True)
+            self._fanout_thread.start()
+
+        self.ffplay_process = self.ffplay_processes[0]
+        self.process_pid = self.ffplay_process.pid
+
     def play_video(self):
         print("play_video")
         self.play_flag = True
@@ -408,11 +570,15 @@ class YouTubeVideo:
             self.url = self.parent.url_entry.get()
             self.divisions = int(self.parent.divisions_spinbox.get())
             write_divisions(self.divisions)
-            # yt-dlp command
-            if self.format is not None:
-                #print("Using default format")
+            # yt-dlp command (a manual Quality choice overrides the auto-picked format)
+            try:
+                quality_fmt = quality_to_format(self.parent.quality.get())
+            except Exception:
+                quality_fmt = None
+            chosen_fmt = quality_fmt or self.format
+            if chosen_fmt is not None:
                 yt_dlp_command = [
-                    self.yt_dlp_path, self.url, '--user-agent', useragent, '-4', '-f', self.format, '-o', '-',
+                    self.yt_dlp_path, self.url, '--user-agent', useragent, '-4', '-f', chosen_fmt, '-o', '-',
                     '--quiet', '--no-warnings'
                 ]
             else:
@@ -423,13 +589,7 @@ class YouTubeVideo:
                     '--quiet', '--no-warnings'
                 ]
             
-            # ffplay command
-            ffplay_command = [
-                self.ffplay_path, '-', '-vf',
-                f'scale=w=iw*{self.divisions}/{self.divisions}:h=ih*{self.divisions}/{self.divisions},'
-                f'fps=source_fps*{self.divisions}*{self.divisions},tile={self.divisions}x{self.divisions}',
-                '-autoexit', '-loglevel', 'error', '-hide_banner', '-fs'
-            ]
+            # (ffplay windows are built per active monitor in _launch_players, below)
 
         
         
@@ -443,17 +603,13 @@ class YouTubeVideo:
                 
             # Use subprocess.PIPE to handle the pipe
             print(yt_dlp_command)
-            print(ffplay_command)
             self.ytdlp_process = subprocess.Popen(
                 yt_dlp_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             
-            self.ffplay_process = subprocess.Popen(
-                ffplay_command, stdin=self.ytdlp_process.stdout, stderr=subprocess.PIPE
-            )
+            self._launch_players()
             
-            self.process_pid = self.ffplay_process.pid
-            print(f"yt-dlp process PID: {self.process_pid}")
+            print(f"Players started on {len(self.ffplay_processes)} monitor(s).")
 
             # Monitor yt-dlp process
             ffplay_alive = False
@@ -533,35 +689,38 @@ class YouTubeVideo:
     def stop_video(self):
         self.play_flag = False
         if self.timer_window is not None:
-            self.timer_window.parent.destroy()
-        if self.process_pid:
-            print("Stopping video")
             try:
-                # Use psutil to handle process tree
-                process = psutil.Process(self.process_pid)
-                for proc in process.children(recursive=True):
-                    print(f"Terminating child process ID: {proc.pid}")
+                self.timer_window.parent.destroy()
+            except Exception:
+                pass
+
+        def _kill(pid):
+            try:
+                p = psutil.Process(pid)
+                for child in p.children(recursive=True):
                     try:
-                        proc.kill()
+                        child.kill()
                     except psutil.NoSuchProcess:
-                        print(f"Child process ID {proc.pid} does not exist anymore.")
-                print(f"Terminating process ID: {self.process_pid}")
-                process.kill()
-                process.wait(timeout=5)
-                print(f"Process ID {self.process_pid} terminated gracefully.")
+                        pass
+                p.kill()
             except psutil.NoSuchProcess:
-                print(f"Process ID {self.process_pid} already terminated.")
-            except subprocess.TimeoutExpired:
-                print(f"Process ID {self.process_pid} did not terminate in time. Forcefully Terminating.")
-                process.kill()
-                print(f"Killed process ID: {self.process_pid}")
-            finally:
-                # Clean up
-                self.process = None
-                self.process_pid = None
-        else:
-            #print("No video instance to stop.")
-            pass
+                pass
+            except Exception:
+                pass
+
+        # Close every ffplay window we opened (one per monitor)
+        for proc in list(getattr(self, 'ffplay_processes', []) or []):
+            _kill(proc.pid)
+        # Stop the single download
+        if getattr(self, 'ytdlp_process', None):
+            _kill(self.ytdlp_process.pid)
+        # Fallback to whatever process_pid pointed at
+        if self.process_pid:
+            _kill(self.process_pid)
+
+        self.ffplay_processes = []
+        self.process = None
+        self.process_pid = None
         self.play_flag = False  # Stop the play flag
 
 class App(tk.Tk):
@@ -586,14 +745,19 @@ class App(tk.Tk):
         self.create_menu()
         self.create_widgets()
         self.load_saved_divisions()
-        
+        self.load_all_settings()
+
         # Initialize with default video
         self.initialize_default_video()
 
+        # Kiosk: auto-start playback if the user enabled it
+        if self.autoplay.get():
+            self.after(2500, self.play_video)
+
     def initialize_default_video(self):
-        if not self.yt_video:
-            self.url_entry.insert(0, DEFAULT_URL)
-            self.after(1, self.update_video_title)
+        if not self.url_entry.get():
+            self.url_entry.set(DEFAULT_URL)
+        self.after(1, self.update_video_title)
             #self.play_video()  # Automatically start playing the default video
 
     def create_widgets(self):
@@ -622,24 +786,70 @@ class App(tk.Tk):
         self.divisions_spinbox.grid(row=3, column=2, padx=10, pady=10, sticky='w')
 
         # Buttons
-        self.stop_button = tk.Button(self, text="■", command=self.stop_video, width=5, height=2, bg='blue', fg='white')
+        self.stop_button = tk.Button(self, text="■", command=self.stop_video, width=7, height=2,
+                                     font=("Helvetica", 16, "bold"), bg='#aa3333', fg='white')
         self.stop_button.grid(row=3, column=3, padx=10, pady=10)
 
-        self.play_button = tk.Button(self, text="▶", command=self.play_video, width=5, height=2, bg='blue', fg='white')
+        self.play_button = tk.Button(self, text="▶", command=self.play_video, width=7, height=2,
+                                     font=("Helvetica", 16, "bold"), bg='#22aa66', fg='white')
         self.play_button.grid(row=3, column=4, padx=10, pady=10)
 
-        # Checkbox
-        self.auto_restart_video = tk.BooleanVar(value=True)  # Checkbox state
-        self.auto_restart_checkbutton = tk.Checkbutton(self, text="Auto Restart Video", variable=self.auto_restart_video)
-        self.auto_restart_checkbutton.grid(row=4, column=1, padx=10, pady=10, sticky='w')  # Use Checkbutton and grid it
+        # ---- Options row ----
+        self.auto_restart_video = tk.BooleanVar(value=True)
+        self.auto_restart_checkbutton = tk.Checkbutton(self, text="Auto Restart", variable=self.auto_restart_video, command=self.save_all_settings)
+        self.auto_restart_checkbutton.grid(row=4, column=1, padx=10, pady=10, sticky='w')
+
+        # Tile across all / selected monitors
+        self.multi_monitor = tk.BooleanVar(value=False)
+        self.selected_monitor_indices = [m['index'] for m in monitor_utils.list_monitors()]
+        self.multi_monitor_checkbutton = tk.Checkbutton(self, text="Multi-monitor", variable=self.multi_monitor, command=self.save_all_settings)
+        self.multi_monitor_checkbutton.grid(row=4, column=2, padx=10, pady=10, sticky='w')
+
+        # Mute audio
+        self.mute = tk.BooleanVar(value=False)
+        self.mute_checkbutton = tk.Checkbutton(self, text="Mute", variable=self.mute, command=self.save_all_settings)
+        self.mute_checkbutton.grid(row=4, column=3, padx=10, pady=10, sticky='w')
+
+        # Pick which monitors to use
+        self.choose_monitors_button = tk.Button(self, text="Monitors…", command=self.choose_monitors)
+        self.choose_monitors_button.grid(row=4, column=4, padx=10, pady=10)
+
+        # ---- Quality + kiosk options row ----
+        self.quality_label = tk.Label(self, text="Quality:", font=("Helvetica", 11))
+        self.quality_label.grid(row=5, column=1, padx=10, pady=6, sticky='e')
+        self.quality = ttk.Combobox(self, values=QUALITY_CHOICES, width=8, state='readonly')
+        self.quality.set('Auto')
+        self.quality.grid(row=5, column=2, padx=10, pady=6, sticky='w')
+        self.quality.bind("<<ComboboxSelected>>", lambda e: self.save_all_settings())
+
+        self.autoplay = tk.BooleanVar(value=False)
+        self.autoplay_checkbutton = tk.Checkbutton(self, text="Auto-play on launch",
+                                                   variable=self.autoplay, command=self.save_all_settings)
+        self.autoplay_checkbutton.grid(row=5, column=3, padx=10, pady=6, sticky='w')
+
+        self.run_at_startup = tk.BooleanVar(value=False)
+        self.run_at_startup_checkbutton = tk.Checkbutton(self, text="Run at Windows startup",
+                                                         variable=self.run_at_startup, command=self.on_toggle_startup)
+        self.run_at_startup_checkbutton.grid(row=5, column=4, padx=10, pady=6, sticky='w')
+
+        # Detected-monitor info line
+        self.monitors_info_label = tk.Label(self, text="", font=("Helvetica", 9), fg="gray30", anchor='w')
+        self.monitors_info_label.grid(row=6, column=1, columnspan=5, padx=10, pady=(0, 2), sticky='w')
+        self.refresh_monitor_info()
 
         
         # Status bar
         self.status_bar = tk.Label(self, text="Status: Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.grid(row=5, column=1, columnspan=5, padx=10, pady=10, sticky='ew')
+        self.status_bar.grid(row=7, column=1, columnspan=5, padx=10, pady=10, sticky='ew')
 
-        # Bind URL entry change to update video title
+        # Bind URL entry change to update video title; Enter starts playback
         self.url_entry.bind("<FocusOut>", self.update_video_title)
+        self.url_entry.bind("<Return>", lambda e: self.play_video())
+
+        # Keyboard shortcuts: Esc = stop, F5 = play, Space = play/pause (ignored while typing a URL)
+        self.bind_all("<Escape>", lambda e: self.stop_video())
+        self.bind_all("<F5>", lambda e: self.play_video())
+        self.bind_all("<space>", self._space_shortcut)
 
         # Configure grid resizing
         self.grid_rowconfigure(0, weight=1)
@@ -653,7 +863,191 @@ class App(tk.Tk):
         self.grid_columnconfigure(2, weight=1)
         self.grid_columnconfigure(3, weight=1)
         self.grid_columnconfigure(4, weight=1)
-    
+
+        self.apply_dark_theme()
+
+    def _space_shortcut(self, event=None):
+        # Don't hijack the spacebar while the user is typing in the URL box
+        try:
+            if self.focus_get() is self.url_entry:
+                return
+        except Exception:
+            pass
+        if self.play_flag:
+            self.stop_video()
+        else:
+            self.play_video()
+
+    def apply_dark_theme(self):
+        BG = "#1e1e1e"
+        FG = "#e6e6e6"
+        FIELD = "#2b2b2b"
+
+        def style_widget(w):
+            cls = w.winfo_class()
+            try:
+                if cls == "Label":
+                    w.configure(bg=BG, fg=FG)
+                elif cls in ("Frame", "Toplevel", "Tk"):
+                    w.configure(bg=BG)
+                elif cls == "Checkbutton":
+                    w.configure(bg=BG, fg=FG, selectcolor=FIELD,
+                                activebackground=BG, activeforeground=FG)
+                elif cls == "Spinbox":
+                    w.configure(bg=FIELD, fg=FG, buttonbackground="#3a3a3a", insertbackground=FG)
+            except tk.TclError:
+                pass
+            for c in w.winfo_children():
+                style_widget(c)
+
+        try:
+            self.configure(bg=BG)
+            style_widget(self)
+            # Keep Play green and Stop red, and the status bar readable
+            self.play_button.configure(bg="#22aa66", fg="white", activebackground="#2bd07f")
+            self.stop_button.configure(bg="#aa3333", fg="white", activebackground="#d04b4b")
+            self.status_bar.configure(bg=FIELD, fg=FG)
+            self.monitors_info_label.configure(fg="#9aa0a6")
+            style = ttk.Style()
+            try:
+                style.theme_use('clam')
+            except Exception:
+                pass
+            style.configure("TCombobox", fieldbackground=FIELD, background="#3a3a3a", foreground=FG)
+        except Exception:
+            pass
+
+    def refresh_monitor_info(self):
+        try:
+            mons = monitor_utils.list_monitors()
+            sel = [m for m in mons if m['index'] in self.selected_monitor_indices]
+            sel_txt = ", ".join("#{}".format(m['index'] + 1) for m in sel) or "none"
+            self.monitors_info_label.config(
+                text="Detected {n} monitor(s).  Selected for multi-monitor: {s}".format(
+                    n=len(mons), s=sel_txt))
+        except Exception:
+            pass
+
+    def identify_monitors(self):
+        """Flash a big number on each monitor so the user can tell which is which."""
+        wins = []
+        for m in monitor_utils.list_monitors():
+            w = tk.Toplevel(self)
+            w.overrideredirect(True)
+            w.geometry("{w}x{h}+{x}+{y}".format(w=m['width'], h=m['height'], x=m['x'], y=m['y']))
+            w.configure(bg='black')
+            try:
+                w.attributes('-topmost', True)
+            except Exception:
+                pass
+            tk.Label(w, text=str(m['index'] + 1), fg='#39d0ff', bg='black',
+                     font=("Helvetica", 240, "bold")).pack(expand=True)
+            wins.append(w)
+        self.after(2500, lambda: [w.destroy() for w in wins])
+
+    def choose_monitors(self):
+        monitors = monitor_utils.list_monitors()
+        dlg = tk.Toplevel(self)
+        dlg.title("Select monitors")
+        dlg.transient(self)
+        dlg.grab_set()
+        tk.Label(dlg, text="Tick the monitors to use for tiled playback:",
+                 font=("Helvetica", 11)).pack(padx=12, pady=(12, 6), anchor='w')
+        rows = []
+        for m in monitors:
+            var = tk.BooleanVar(value=(m['index'] in self.selected_monitor_indices))
+            tk.Checkbutton(dlg, text=monitor_utils.describe(m), variable=var).pack(
+                padx=18, pady=2, anchor='w')
+            rows.append((m['index'], var))
+
+        def set_all(value):
+            for _, v in rows:
+                v.set(value)
+
+        def apply_sel():
+            chosen = [idx for idx, v in rows if v.get()]
+            if not chosen:
+                messagebox.showwarning("Monitors", "Please tick at least one monitor.")
+                return
+            self.selected_monitor_indices = chosen
+            if len(chosen) > 1:
+                self.multi_monitor.set(True)
+            self.save_all_settings()
+            dlg.destroy()
+
+        helpers = tk.Frame(dlg)
+        helpers.pack(pady=(8, 0))
+        tk.Button(helpers, text="Select all", command=lambda: set_all(True)).pack(side=tk.LEFT, padx=6)
+        tk.Button(helpers, text="Select none", command=lambda: set_all(False)).pack(side=tk.LEFT, padx=6)
+        tk.Button(helpers, text="Identify", command=self.identify_monitors).pack(side=tk.LEFT, padx=6)
+
+        btns = tk.Frame(dlg)
+        btns.pack(pady=12)
+        tk.Button(btns, text="OK", width=10, command=apply_sel).pack(side=tk.LEFT, padx=10)
+        tk.Button(btns, text="Cancel", width=10, command=dlg.destroy).pack(side=tk.LEFT, padx=10)
+
+    def save_all_settings(self):
+        """Persist every GUI choice so the next launch starts the same way."""
+        try:
+            url = self.url_entry.get().strip()
+            # Remember any new URL the user typed, so it stays in the dropdown
+            urls = list(self.url_entry['values'])
+            if url and url not in urls:
+                urls.append(url)
+                self.url_entry['values'] = urls
+            write_settings({
+                'url': url,
+                'urls': urls,
+                'divisions': int(self.divisions_spinbox.get()),
+                'auto_restart': bool(self.auto_restart_video.get()),
+                'multi_monitor': bool(self.multi_monitor.get()),
+                'selected_monitor_indices': list(self.selected_monitor_indices),
+                'mute': bool(self.mute.get()),
+                'quality': self.quality.get(),
+                'autoplay': bool(self.autoplay.get()),
+                'run_at_startup': bool(self.run_at_startup.get()),
+            })
+        except Exception:
+            pass
+        self.refresh_monitor_info()
+
+    def on_toggle_startup(self):
+        ok = set_run_at_startup(bool(self.run_at_startup.get()))
+        if not ok:
+            messagebox.showwarning(
+                "Run at startup",
+                "Could not change the Windows startup setting.")
+            self.run_at_startup.set(False)
+        self.save_all_settings()
+
+    def load_all_settings(self):
+        """Apply persisted choices to the widgets on startup."""
+        data = read_settings()
+        try:
+            avail = [m['index'] for m in monitor_utils.list_monitors()]
+            sel = [i for i in data.get('selected_monitor_indices', []) if i in avail]
+            if sel:
+                self.selected_monitor_indices = sel
+            d = int(data.get('divisions', 3))
+            if 1 <= d <= 50:
+                self.divisions_spinbox.delete(0, tk.END)
+                self.divisions_spinbox.insert(0, d)
+            self.auto_restart_video.set(bool(data.get('auto_restart', True)))
+            self.multi_monitor.set(bool(data.get('multi_monitor', False)))
+            self.mute.set(bool(data.get('mute', False)))
+            urls = data.get('urls') or list(self.url_entry['values'])
+            if urls:
+                self.url_entry['values'] = urls
+            if data.get('quality') in QUALITY_CHOICES:
+                self.quality.set(data['quality'])
+            self.autoplay.set(bool(data.get('autoplay', False)))
+            self.run_at_startup.set(bool(data.get('run_at_startup', False)))
+            if data.get('url'):
+                self.url_entry.set(data['url'])
+        except Exception:
+            pass
+        self.refresh_monitor_info()
+
     def create_menu(self):
         menubar = tk.Menu(self)
 
@@ -708,7 +1102,8 @@ class App(tk.Tk):
         # Start video playback in a separate thread
         url = self.url_entry.get()
         divisions = int(self.divisions_spinbox.get())
-        
+        self.save_all_settings()  # remember the latest choices
+
         self.yt_video = YouTubeVideo(self, url, divisions)
         if self.yt_video.ytdlp_is_valid == False:
             print("Video URL is not valid")
@@ -758,6 +1153,7 @@ class App(tk.Tk):
             self.divisions_spinbox.insert(0, 3)
 
     def on_closing(self):
+        self.save_all_settings()  # remember choices for next launch
         self.stop_video()  # Ensure the video is stopped before closing
         self.destroy()
 
