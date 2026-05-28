@@ -360,9 +360,15 @@ class Player:
                         s.write(chunk)
                         s.flush()
                     except (BrokenPipeError, OSError, ValueError):
+                        # This player went away: drop it AND close its writer
+                        # now, so it is never left for the GC to finalize.
                         try:
                             stdins.remove(s)
                         except ValueError:
+                            pass
+                        try:
+                            s.close()
+                        except Exception:
                             pass
                 if not stdins:
                     break
@@ -387,12 +393,28 @@ class Player:
         return all(p.poll() is None for p in self.ffplay_processes)
 
     def _terminate(self):
-        for p in self.ffplay_processes:
-            _kill_tree(p)
-        self.ffplay_processes = []
+        # Kill the download FIRST so the fan-out thread sees EOF on its source,
+        # exits its loop, and closes the pipe writers in its own `finally`. Then
+        # join it, so the writers are released deterministically by our code -
+        # never left for the garbage collector, which would try to flush to a
+        # dead pipe and print an OSError from the finalizer on Windows.
         if self.ytdlp_process:
             _kill_tree(self.ytdlp_process)
             self.ytdlp_process = None
+        t = self._fanout_thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2)
+        self._fanout_thread = None
+        for p in self.ffplay_processes:
+            # Belt-and-braces: the fan-out already closed these on EOF; a second
+            # close is a harmless no-op (and covers the single-window path).
+            if p.stdin:
+                try:
+                    p.stdin.close()
+                except Exception:
+                    pass
+            _kill_tree(p)
+        self.ffplay_processes = []
 
     # ---- worker entry point ---------------------------------------------- #
     def run(self):
