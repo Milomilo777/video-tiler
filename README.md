@@ -57,6 +57,10 @@ a real Mac.)
 4. For several screens: tick **Multi-monitor**, then **Monitors…** to choose
    which ones (the **Identify** button flashes each monitor's number).
 
+## Architecture
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design (playback engine,
+threading model, reconnect/self-heal, settings).
+
 ## Problems
 * The PyInstaller build can be falsely flagged as a virus by some antivirus
   engines despite containing none.

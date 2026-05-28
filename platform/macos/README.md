@@ -61,9 +61,9 @@ unnecessary system-wide security downgrade.
 
 ## What still needs a real Mac
 
-- Window-focus detection (used to notice when the player window closed) is
-  Windows-only; on macOS the app falls back to a simple process-alive check,
-  which is fine but less precise.
+- Playback liveness is read from the subprocess handles (`Popen.poll()`), which
+  is fully cross-platform - there is no Windows-only code path on macOS anymore.
 - ffplay window placement for multi-monitor uses `-left/-top/-noborder`;
   behaviour across macOS Spaces/displays should be verified.
-- "Run at Windows startup" is a no-op on macOS (use a LaunchAgent instead).
+- "Run at Windows startup" is a no-op on macOS (use a LaunchAgent instead); the
+  toggle simply reports it could not be set.
