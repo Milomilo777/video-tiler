@@ -125,6 +125,7 @@ DEFAULT_SETTINGS = {
     'quality': 'Auto',
     'autoplay': False,
     'run_at_startup': False,
+    'theme': 'Light',
 }
 
 QUALITY_CHOICES = ['Auto', '1080p', '720p', '480p', '360p', '240p', '144p']
@@ -741,7 +742,8 @@ class App(tk.Tk):
         self.yt_video = None
         self.video_thread = None
         self.play_flag = False  # Flag to track play state
-        
+        self.theme_var = tk.StringVar(value='Light')
+
         self.create_menu()
         self.create_widgets()
         self.load_saved_divisions()
@@ -786,13 +788,15 @@ class App(tk.Tk):
         self.divisions_spinbox.grid(row=3, column=2, padx=10, pady=10, sticky='w')
 
         # Buttons
-        self.stop_button = tk.Button(self, text="■", command=self.stop_video, width=7, height=2,
-                                     font=("Helvetica", 16, "bold"), bg='#aa3333', fg='white')
-        self.stop_button.grid(row=3, column=3, padx=10, pady=10)
+        self.stop_button = tk.Button(self, text="■  Stop", command=self.stop_video, width=9,
+                                     font=("Helvetica", 10), relief='flat', bd=0, cursor='hand2',
+                                     highlightthickness=0)
+        self.stop_button.grid(row=3, column=3, padx=8, pady=8)
 
-        self.play_button = tk.Button(self, text="▶", command=self.play_video, width=7, height=2,
-                                     font=("Helvetica", 16, "bold"), bg='#22aa66', fg='white')
-        self.play_button.grid(row=3, column=4, padx=10, pady=10)
+        self.play_button = tk.Button(self, text="▶  Play", command=self.play_video, width=9,
+                                     font=("Helvetica", 10), relief='flat', bd=0, cursor='hand2',
+                                     highlightthickness=0)
+        self.play_button.grid(row=3, column=4, padx=8, pady=8)
 
         # ---- Options row ----
         self.auto_restart_video = tk.BooleanVar(value=True)
@@ -864,7 +868,7 @@ class App(tk.Tk):
         self.grid_columnconfigure(3, weight=1)
         self.grid_columnconfigure(4, weight=1)
 
-        self.apply_dark_theme()
+        self.apply_theme()
 
     def _space_shortcut(self, event=None):
         # Don't hijack the spacebar while the user is typing in the URL box
@@ -878,10 +882,26 @@ class App(tk.Tk):
         else:
             self.play_video()
 
-    def apply_dark_theme(self):
-        BG = "#1e1e1e"
-        FG = "#e6e6e6"
-        FIELD = "#2b2b2b"
+    # Two restrained palettes; one subtle accent for the primary action, neutral for the rest.
+    THEMES = {
+        'Light': {
+            'bg': '#f4f5f7', 'fg': '#1f2937', 'field': '#ffffff', 'sub': '#e4e7eb',
+            'sub_fg': '#374151', 'info': '#6b7280', 'status': '#e9ebef', 'border': '#d1d5db',
+        },
+        'Dark': {
+            'bg': '#1f2228', 'fg': '#e6e6e6', 'field': '#2b2f36', 'sub': '#353a42',
+            'sub_fg': '#e6e6e6', 'info': '#9aa0a6', 'status': '#2b2f36', 'border': '#3a3f47',
+        },
+    }
+    ACCENT = '#3b6ea5'        # restrained slate-blue for the primary (Play) action
+    ACCENT_HOVER = '#4a7fb8'
+
+    def apply_theme(self, theme=None):
+        if theme is None:
+            theme = self.theme_var.get()
+        p = self.THEMES.get(theme, self.THEMES['Light'])
+        BG, FG, FIELD = p['bg'], p['fg'], p['field']
+        SUB, SUB_FG = p['sub'], p['sub_fg']
 
         def style_widget(w):
             cls = w.winfo_class()
@@ -894,7 +914,8 @@ class App(tk.Tk):
                     w.configure(bg=BG, fg=FG, selectcolor=FIELD,
                                 activebackground=BG, activeforeground=FG)
                 elif cls == "Spinbox":
-                    w.configure(bg=FIELD, fg=FG, buttonbackground="#3a3a3a", insertbackground=FG)
+                    w.configure(bg=FIELD, fg=FG, buttonbackground=SUB,
+                                insertbackground=FG, relief='flat', highlightthickness=0)
             except tk.TclError:
                 pass
             for c in w.winfo_children():
@@ -903,17 +924,21 @@ class App(tk.Tk):
         try:
             self.configure(bg=BG)
             style_widget(self)
-            # Keep Play green and Stop red, and the status bar readable
-            self.play_button.configure(bg="#22aa66", fg="white", activebackground="#2bd07f")
-            self.stop_button.configure(bg="#aa3333", fg="white", activebackground="#d04b4b")
-            self.status_bar.configure(bg=FIELD, fg=FG)
-            self.monitors_info_label.configure(fg="#9aa0a6")
+            # Primary action: a single subtle accent. Secondary: neutral. No bright green/red.
+            self.play_button.configure(bg=self.ACCENT, fg='white',
+                                       activebackground=self.ACCENT_HOVER, activeforeground='white')
+            self.stop_button.configure(bg=SUB, fg=SUB_FG, activebackground=SUB, activeforeground=SUB_FG)
+            self.status_bar.configure(bg=p['status'], fg=FG)
+            self.monitors_info_label.configure(bg=BG, fg=p['info'])
             style = ttk.Style()
             try:
                 style.theme_use('clam')
             except Exception:
                 pass
-            style.configure("TCombobox", fieldbackground=FIELD, background="#3a3a3a", foreground=FG)
+            style.configure("TCombobox", fieldbackground=FIELD, background=SUB,
+                            foreground=FG, arrowcolor=FG, bordercolor=p['border'])
+            style.map("TCombobox", fieldbackground=[('readonly', FIELD)],
+                      foreground=[('readonly', FG)])
         except Exception:
             pass
 
@@ -1006,6 +1031,7 @@ class App(tk.Tk):
                 'quality': self.quality.get(),
                 'autoplay': bool(self.autoplay.get()),
                 'run_at_startup': bool(self.run_at_startup.get()),
+                'theme': self.theme_var.get(),
             })
         except Exception:
             pass
@@ -1042,6 +1068,9 @@ class App(tk.Tk):
                 self.quality.set(data['quality'])
             self.autoplay.set(bool(data.get('autoplay', False)))
             self.run_at_startup.set(bool(data.get('run_at_startup', False)))
+            if data.get('theme') in self.THEMES:
+                self.theme_var.set(data['theme'])
+                self.apply_theme()
             if data.get('url'):
                 self.url_entry.set(data['url'])
         except Exception:
@@ -1063,10 +1092,24 @@ class App(tk.Tk):
         about_menu.add_command(label="Source code", command=self.open_source_code_web_site, font=menu_font)
         about_menu.add_command(label="Help", command=self.show_help, font=menu_font)
 
+        # View menu: let the user choose the theme (not imposed)
+        view_menu = tk.Menu(menubar, tearoff=0)
+        theme_menu = tk.Menu(view_menu, tearoff=0)
+        theme_menu.add_radiobutton(label="Light", variable=self.theme_var, value="Light",
+                                   command=self.on_theme_change, font=menu_font)
+        theme_menu.add_radiobutton(label="Dark", variable=self.theme_var, value="Dark",
+                                   command=self.on_theme_change, font=menu_font)
+        view_menu.add_cascade(label="Theme", menu=theme_menu, font=menu_font)
+        menubar.add_cascade(label="View", menu=view_menu, font=menu_font_small)
+
         menubar.add_cascade(label="About", menu=about_menu, font=menu_font_small)
 
         # Configure the menu bar with zero padding (if applicable)
         self.config(menu=menubar)
+
+    def on_theme_change(self):
+        self.apply_theme()
+        self.save_all_settings()
         
     def show_help(self):
         help_text = f"Program Version: {PROGRAM_VERSION}\nEmail: {AUTHOR_EMAIL}\nWebsite: {AUTHOR_WEBSITE}"
