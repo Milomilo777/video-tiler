@@ -1163,8 +1163,12 @@ class App(tk.Tk):
         try:
             self.configure(bg=BG)
             self._style_subtree(self)
+            # disabledforeground must stay legible: while playing, the Play
+            # button is disabled, and Tk's default grey disabled text is nearly
+            # invisible on the slate accent. Use a light tint instead.
             self.play_button.configure(bg=self.ACCENT, fg='white',
-                                       activebackground=self.ACCENT_HOVER, activeforeground='white')
+                                       activebackground=self.ACCENT_HOVER, activeforeground='white',
+                                       disabledforeground='#dce7f4')
             self.stop_button.configure(bg=SUB, fg=SUB_FG, activebackground=SUB, activeforeground=SUB_FG)
             self.status_bar.configure(bg=p['status'], fg=FG)
             self.monitors_info_label.configure(bg=BG, fg=p['info'])
