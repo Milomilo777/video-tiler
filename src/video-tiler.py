@@ -21,6 +21,7 @@ import logging
 import threading
 import subprocess
 import webbrowser
+import collections
 import urllib.request
 from logging.handlers import RotatingFileHandler
 
@@ -39,8 +40,24 @@ import monitor_utils
 # --------------------------------------------------------------------------- #
 #  Constants
 # --------------------------------------------------------------------------- #
+def _read_version(default="1.1"):
+    """Single source of truth: read the VERSION file shipped next to the code
+    (or bundled into a PyInstaller build) so the in-app version, the update
+    check, and the packaged build never drift apart."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    for cand in (os.path.join(base, 'VERSION'), os.path.join(os.path.dirname(base), 'VERSION')):
+        try:
+            with open(cand, 'r', encoding='utf-8') as f:
+                v = f.read().strip()
+            if v:
+                return v
+        except Exception:
+            pass
+    return default
+
+
 APP_NAME = "videotiler"
-PROGRAM_VERSION = "1.1"
+PROGRAM_VERSION = _read_version()
 PROGRAM_AUTHOR = "Bluesun"
 AUTHOR_EMAIL = "smtv.bot@gmail.com"
 AUTHOR_WEBSITE = "https://github.com/translation-robot/video-tiler"
@@ -101,7 +118,12 @@ def add_to_path():
 
 
 def find_executable(name):
-    """Locate yt-dlp / ffmpeg / ffplay on PATH, next to this file, or in ./bin."""
+    """Locate yt-dlp / ffmpeg / ffplay on PATH, next to this file, or in ./bin.
+
+    Deliberately NOT cached: tool paths are re-resolved on each playback start
+    so a transient absence (e.g. a sibling bin folder on a network share that
+    briefly drops, or yt-dlp.exe mid self-update) self-recovers on reconnect.
+    """
     found = shutil.which(name)
     if found:
         return found
@@ -112,6 +134,28 @@ def find_executable(name):
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 return p
     return None
+
+
+def is_valid_stream_url(url):
+    """Only accept http(s) URLs. This guards yt-dlp against argument injection
+    (a value starting with '-' would otherwise be read as an option such as
+    --exec / --config-location) and rejects junk from a tampered settings file."""
+    if not isinstance(url, str):
+        return False
+    u = url.strip()
+    return u.lower().startswith(("http://", "https://"))
+
+
+def _looks_like_pip_ytdlp(update_output):
+    """True if `yt-dlp -U` output indicates a pip/package-manager/source install
+    (which -U cannot self-update). yt-dlp prints a message telling the user to
+    update via their installer; we match its specific phrases. Deliberately NOT
+    a bare 'pip' substring (which would false-match e.g. 'broken pipe')."""
+    s = (update_output or "").lower()
+    needles = ("with pip", "via pip", "use pip", "pip or your package manager",
+               "package manager", "tarball", "setup.py", "you installed",
+               "use that to update", "not a self-contained")
+    return any(n in s for n in needles)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,39 +176,66 @@ def _init_paths():
 
 def _init_logging():
     """A small rotating log in the data dir - the only window into what an
-    unattended kiosk did when no console is attached (windowed/frozen builds)."""
-    if any(isinstance(h, RotatingFileHandler) for h in log.handlers):
+    unattended kiosk did when no console is attached (windowed/frozen builds).
+    If the file handler can't be created (locked by a second instance, read-only
+    data dir), fall back to stderr and say so, rather than running blind."""
+    if log.handlers and any(not isinstance(h, logging.NullHandler) for h in log.handlers):
         return
     log.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)-7s %(message)s', '%Y-%m-%d %H:%M:%S')
     try:
         handler = RotatingFileHandler(
             LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding='utf-8')
-        handler.setFormatter(logging.Formatter(
-            '%(asctime)s %(levelname)-7s %(message)s', '%Y-%m-%d %H:%M:%S'))
+        handler.setFormatter(fmt)
         log.addHandler(handler)
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            sh = logging.StreamHandler()
+            sh.setFormatter(fmt)
+            log.addHandler(sh)
+            log.warning("could not open log file %s (%s); logging to stderr only", LOG_FILE, e)
+        except Exception:
+            pass
     log.info("=== Video Tiler %s starting (pid %s) ===", PROGRAM_VERSION, os.getpid())
 
 
 def read_settings():
     data = dict(DEFAULT_SETTINGS)
+    if not SETTINGS_FILE or not os.path.exists(SETTINGS_FILE):
+        return data
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             saved = json.load(f)
         if isinstance(saved, dict):
             data.update(saved)
-    except Exception:
-        pass
+        else:
+            log.warning("settings file is not a JSON object; using defaults: %s", SETTINGS_FILE)
+    except Exception as e:
+        # Don't silently lose all config: say so, and keep the bad file for a
+        # human to inspect rather than overwriting it blindly.
+        log.warning("could not read settings (%s); using defaults: %s", e, SETTINGS_FILE)
     return data
 
 
 def write_settings(data):
+    """Write atomically (tmp + os.replace) so a crash/power loss mid-write can
+    never leave a truncated settings.json that wipes the kiosk's config."""
+    if not SETTINGS_FILE:
+        return
+    tmp = SETTINGS_FILE + '.tmp'
     try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
-    except Exception:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        log.warning("could not write settings (%s): %s", e, SETTINGS_FILE)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -217,9 +288,54 @@ def select_format(quality, divisions):
     /best so playback never fails just because a resolution is unavailable."""
     heights = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240, '144p': 144}
     h = heights.get(quality)
-    if h is None:  # Auto
-        h = 360 if divisions <= 17 else (240 if divisions <= 35 else 144)
+    if h is None:  # Auto: sparse grids want full resolution (a single tile fills
+        # the screen); only dense grids can drop resolution without looking soft.
+        if divisions <= 2:
+            h = 1080
+        elif divisions <= 4:
+            h = 720
+        elif divisions <= 17:
+            h = 360
+        elif divisions <= 35:
+            h = 240
+        else:
+            h = 144
     return "best[height<={h}]/best[height<={h2}]/best".format(h=h, h2=h + 360)
+
+
+def next_backoff(prev, cap=30):
+    """Exponential reconnect backoff, capped. Pure (so it is unit-testable)."""
+    return min(prev * 2, cap)
+
+
+def clamp_divisions(raw, lo=1, hi=64, default=3):
+    """Clamp a grid-divisions value to [lo, hi]; non-integers fall back to
+    default. Guards the ffmpeg tile=NxN filter from garbage input."""
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_title_async(app, url, callback):
+    """Fetch a stream's title off the GUI thread, then deliver it via post_ui.
+    Lives at module level (not on Player) so the title probe doesn't build a
+    throwaway Player or scan PATH for executables it never uses."""
+    def worker():
+        title = url
+        try:
+            if is_valid_stream_url(url):
+                opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False, process=False)
+                    title = (info or {}).get('title') or url
+        except Exception:
+            pass
+        try:
+            app.post_ui(lambda: callback(title))
+        except Exception:
+            pass
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _kill_tree(proc):
@@ -252,8 +368,14 @@ class Player:
     GUI only through app.post_ui(). stop() tears everything down.
     """
 
-    HEALTHY_SECONDS = 60   # a session this long resets backoff + self-heal
-    HEAL_AFTER_FAILS = 2   # consecutive failures before we update yt-dlp
+    HEALTHY_SECONDS = 60    # a session this long resets backoff + self-heal
+    HEAL_AFTER_FAILS = 2    # consecutive failures before we update yt-dlp
+    REHEAL_EVERY = 20       # re-arm self-heal every N failures so a yt-dlp fix
+                            # shipped days later is eventually picked up
+    OFFLINE_AFTER_FAILS = 10  # surface an explicit "offline" status past this
+    ANNOUNCE_AFTER = 2.0    # only show "Playing" once a session survives this long
+    FANOUT_QUEUE_MAX = 32   # per-consumer buffer (small, to keep tiles in sync)
+    FANOUT_PUT_TIMEOUT = 2.0  # a consumer full THIS long is genuinely wedged
 
     def __init__(self, app, url, divisions):
         self.app = app
@@ -265,39 +387,44 @@ class Player:
         self.ffplay_path = find_executable('ffplay')
         self.tools_ok = bool(self.yt_dlp_path and self.ffmpeg_path and self.ffplay_path)
         self.play_flag = False
+        # All of the following are touched from both the worker and the GUI
+        # thread, so every read/mutation goes through self._lock (an RLock,
+        # because _start() calls _terminate()).
+        self._lock = threading.RLock()
         self.ytdlp_process = None
         self.ffplay_processes = []
-        self._fanout_thread = None
+        self._consumers = []        # multi-monitor: one {proc,q,thread,dead} each
+        self._fanout_thread = None  # reader: yt-dlp stdout -> consumer queues
+        self._fanout_stop = None    # threading.Event signalling the reader to stop
+        self._stderr_thread = None  # drains yt-dlp stderr into _stderr_tail
+        self._stderr_tail = None    # last lines of yt-dlp stderr (for diagnosis)
         self._fail_count = 0
         self._healed = False
 
     # ---- title (async; never blocks the GUI) ------------------------------ #
     def fetch_title_async(self, callback):
-        def worker():
-            title = self.url
-            try:
-                opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(self.url, download=False, process=False)
-                    title = info.get('title') or self.url
-            except Exception:
-                pass
-            self.title = title
-            self.app.post_ui(lambda: callback(title))
-        threading.Thread(target=worker, daemon=True).start()
+        def on_title(t):
+            self.title = t
+            callback(t)
+        fetch_title_async(self.app, self.url, on_title)
 
     # ---- command building ------------------------------------------------- #
     def _yt_dlp_cmd(self):
         # Plain-attribute mirrors (set on the main thread) - workers must never
         # read Tk variables directly. See App._sync_runtime_options.
         quality = getattr(self.app, 'opt_quality', 'Auto')
+        # NOTE: no '-4' (forcing IPv4 dead-loops the kiosk on IPv6-only links;
+        # let yt-dlp choose). No '--quiet' so real errors reach the stderr we
+        # capture. The URL goes AFTER a '--' end-of-options marker so a value
+        # starting with '-' can never be parsed as a yt-dlp option (injection).
         return [
-            self.yt_dlp_path, self.url,
+            self.yt_dlp_path,
             '--extractor-args', 'youtube:player_client=' + YT_PLAYER_CLIENTS,
-            '-4', '--quiet', '--no-warnings',
+            '--no-warnings',
             '--retries', '10', '--socket-timeout', '15',
             '-f', select_format(quality, self.divisions),
             '-o', '-',
+            '--', self.url,
         ]
 
     def _targets(self):
@@ -306,167 +433,356 @@ class Player:
         selected = list(getattr(self.app, 'selected_monitor_indices', []))
         return monitor_utils.select_monitors(monitors, selected, multi), multi
 
-    def _ffplay_cmd(self, mon, multi, muted):
+    def _ffplay_cmd(self, mon, single, muted):
+        # A SINGLE window uses true fullscreen (-fs, scales to fill the screen).
+        # Only a multi-window wall uses a borderless window placed on one monitor
+        # (keyed on the actual target COUNT, not the multi flag, so a 1-of-N
+        # selection still fills its screen instead of leaving a desktop sliver).
         vf, ow, oh = monitor_utils.tile_filter_for(mon['width'], mon['height'], self.divisions)
-        win = monitor_utils.window_opts_for(mon, ow, oh) if multi else ['-fs']
+        win = ['-fs'] if single else monitor_utils.window_opts_for(mon, ow, oh)
         audio = ['-an'] if muted else []
         return [self.ffplay_path, '-', '-vf', vf,
-                '-autoexit', '-loglevel', 'error', '-hide_banner'] + audio + win
+                '-autoexit', '-loglevel', 'warning', '-hide_banner'] + audio + win
 
     # ---- process lifecycle ------------------------------------------------ #
     def _start(self):
-        self._terminate()
-        self.ytdlp_process = subprocess.Popen(
-            self._yt_dlp_cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW)
+        self._terminate(join=True)   # clean slate (handles any previous run)
+        if not self.play_flag:
+            return                   # a stop arrived; do not launch anything
+
+        # Resolve tools + launch OUTSIDE the lock: find_executable scans PATH
+        # (slow if a sibling 'bin' is on a dropped network share) and Popen has
+        # cost; doing it under the lock would make a GUI Stop block on it. We
+        # only take the lock to PUBLISH the handles. Re-resolve every start so a
+        # transient tool absence self-recovers.
+        yt_path = find_executable('yt-dlp')
+        ff_path = find_executable('ffplay')
+        if not yt_path or not ff_path:
+            raise RuntimeError("yt-dlp/ffplay not found on PATH")
+        self.yt_dlp_path, self.ffplay_path = yt_path, ff_path
 
         targets, multi = self._targets()
         muted = bool(getattr(self.app, 'opt_mute', False))
+        single = len(targets) <= 1
         log.info("start: url=%s divisions=%d windows=%d multi=%s muted=%s",
                  self.url, self.divisions, len(targets), multi, muted)
 
-        if len(targets) <= 1:
-            # Single window reads the download directly.
-            proc = subprocess.Popen(
-                self._ffplay_cmd(targets[0], multi, muted),
-                stdin=self.ytdlp_process.stdout, stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW)
-            self.ffplay_processes = [proc]
-        else:
-            # One window per monitor; fan the single download out to all of them.
-            # Only the first keeps audio (the rest are muted) to avoid echo.
-            stdins = []
-            self.ffplay_processes = []
-            for i, mon in enumerate(targets):
-                proc = subprocess.Popen(
-                    self._ffplay_cmd(mon, multi, muted or i > 0),
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    creationflags=CREATE_NO_WINDOW)
-                self.ffplay_processes.append(proc)
-                stdins.append(proc.stdin)
-            self._fanout_thread = threading.Thread(
-                target=self._fanout, args=(self.ytdlp_process.stdout, stdins), daemon=True)
-            self._fanout_thread.start()
+        ytdlp = subprocess.Popen(
+            self._yt_dlp_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW)
+        # Drain yt-dlp's stderr into a small ring buffer so the log can say WHY
+        # a session dropped (HTTP 403, format gone, geo-block, ...).
+        stderr_tail = collections.deque(maxlen=40)
+        stderr_thread = threading.Thread(target=self._drain_stderr,
+                                         args=(ytdlp.stderr, stderr_tail), daemon=True)
+        stderr_thread.start()
 
-    def _fanout(self, source, stdins):
-        """Copy the one download to every ffplay stdin."""
+        ffplay, consumers, stop_event, fanout_thread = [], [], None, None
         try:
-            while True:
+            if single:
+                # One window reads the download directly (no fan-out thread).
+                ffplay = [subprocess.Popen(
+                    self._ffplay_cmd(targets[0], True, muted),
+                    stdin=ytdlp.stdout, stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW)]
+            else:
+                # One window per monitor. The single download is fanned out to
+                # each via its own bounded queue + writer thread, so one slow
+                # screen cannot head-of-line-block (freeze) the whole wall.
+                # Only the first keeps audio (rest get -an) to avoid echo.
+                stop_event = threading.Event()
+                for i, mon in enumerate(targets):
+                    proc = subprocess.Popen(
+                        self._ffplay_cmd(mon, False, muted or i > 0),
+                        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW)
+                    c = {'proc': proc, 'q': queue.Queue(maxsize=self.FANOUT_QUEUE_MAX),
+                         'dead': False}
+                    c['thread'] = threading.Thread(target=self._consumer_writer,
+                                                   args=(c,), daemon=True)
+                    c['thread'].start()
+                    ffplay.append(proc)
+                    consumers.append(c)
+                fanout_thread = threading.Thread(
+                    target=self._fanout, args=(ytdlp.stdout, stop_event, consumers),
+                    daemon=True)
+                fanout_thread.start()
+        except Exception:
+            _kill_tree(ytdlp)
+            for p in ffplay:
+                _kill_tree(p)
+            raise
+
+        # Publish under the lock. If a Stop landed during the launch, tear the
+        # freshly-built pipeline down instead of leaving it orphaned.
+        with self._lock:
+            published = self.play_flag
+            if published:
+                self.ytdlp_process = ytdlp
+                self._stderr_tail = stderr_tail
+                self._stderr_thread = stderr_thread
+                self.ffplay_processes = ffplay
+                self._consumers = consumers
+                self._fanout_stop = stop_event
+                self._fanout_thread = fanout_thread
+        if not published:
+            if stop_event:
+                stop_event.set()
+            _kill_tree(ytdlp)
+            for p in ffplay:
+                _kill_tree(p)
+
+    def _drain_stderr(self, stream, tail):
+        """Keep the last lines of a subprocess's stderr for diagnosis."""
+        try:
+            for raw in iter(stream.readline, b''):
+                try:
+                    line = raw.decode('utf-8', 'ignore').rstrip()
+                except Exception:
+                    line = str(raw)
+                if line:
+                    tail.append(line)
+        except Exception:
+            pass
+
+    def _retire(self, c):
+        """Retire one fallen-behind consumer. KILL the ffplay first (so a writer
+        blocked in stdin.write faults out immediately - closing the write end
+        does nothing to a process that has stopped reading), THEN close the pipe.
+        Killing also flips poll(), so _alive() trips and the wall relaunches."""
+        c['dead'] = True
+        _kill_tree(c['proc'])
+        try:
+            if c['proc'].stdin:
+                c['proc'].stdin.close()
+        except Exception:
+            pass
+
+    def _fanout(self, source, stop_event, consumers):
+        """Reader: copy the one download to every consumer's queue. A consumer
+        that cannot keep up is RETIRED (killed) rather than having bytes dropped
+        (dropping bytes would corrupt its container stream). A retired window
+        fails _alive() - both via its dead flag and its now-exited process - so
+        the wall relaunches promptly.
+        """
+        try:
+            while not stop_event.is_set():
                 chunk = source.read(65536)
                 if not chunk:
                     break
-                for s in list(stdins):
+                live = 0
+                for c in consumers:
+                    if c.get('dead'):
+                        continue
                     try:
-                        s.write(chunk)
-                        s.flush()
-                    except (BrokenPipeError, OSError, ValueError):
-                        # This player went away: drop it AND close its writer
-                        # now, so it is never left for the GC to finalize.
-                        try:
-                            stdins.remove(s)
-                        except ValueError:
-                            pass
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                if not stdins:
+                        # Block briefly: a healthy-but-busy consumer drains within
+                        # milliseconds (no false retirement on a transient burst);
+                        # only one full for the whole timeout is genuinely wedged.
+                        c['q'].put(chunk, timeout=self.FANOUT_PUT_TIMEOUT)
+                        live += 1
+                    except queue.Full:
+                        log.warning("fan-out: a player fell behind; retiring it "
+                                    "(the wall will relaunch)")
+                        self._retire(c)
+                if live == 0:
                     break
         except Exception:
             pass
         finally:
-            for s in list(stdins):
+            # Tell every writer to finish (sentinel); harmless if its queue is full.
+            for c in consumers:
                 try:
-                    s.close()
+                    c['q'].put_nowait(None)
                 except Exception:
                     pass
+
+    def _consumer_writer(self, c):
+        """One per ffplay window: drain its queue to that window's stdin."""
+        q, stdin = c['q'], c['proc'].stdin
+        try:
+            while True:
+                chunk = q.get()
+                if chunk is None:
+                    break
+                stdin.write(chunk)
+                stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                stdin.close()
+            except Exception:
+                pass
 
     def _alive(self):
         # Require the download AND every player window to be alive. Using "all"
         # (not "any") means a single dead monitor in a multi-screen wall is
         # detected and triggers a clean relaunch, instead of leaving that screen
-        # black while the others keep playing.
+        # black while the others keep playing. A consumer the fan-out RETIRED is
+        # also treated as not-alive immediately (its dead flag), so recovery does
+        # not wait on a wedged ffplay noticing EOF.
         if not self.ytdlp_process or self.ytdlp_process.poll() is not None:
+            return False
+        if any(c.get('dead') for c in self._consumers):
             return False
         if not self.ffplay_processes:
             return False
         return all(p.poll() is None for p in self.ffplay_processes)
 
-    def _terminate(self):
-        # Kill the download FIRST so the fan-out thread sees EOF on its source,
-        # exits its loop, and closes the pipe writers in its own `finally`. Then
-        # join it, so the writers are released deterministically by our code -
-        # never left for the garbage collector, which would try to flush to a
-        # dead pipe and print an OSError from the finalizer on Windows.
-        if self.ytdlp_process:
-            _kill_tree(self.ytdlp_process)
-            self.ytdlp_process = None
-        t = self._fanout_thread
-        if t and t.is_alive() and t is not threading.current_thread():
-            t.join(timeout=2)
-        self._fanout_thread = None
-        for p in self.ffplay_processes:
-            # Belt-and-braces: the fan-out already closed these on EOF; a second
-            # close is a harmless no-op (and covers the single-window path).
-            if p.stdin:
+    def _death_reason(self):
+        """Short human note for the log: which handle ended (call BEFORE
+        _terminate, while the handles are still valid)."""
+        if not self.ytdlp_process or self.ytdlp_process.poll() is not None:
+            tail = list(self._stderr_tail or [])[-3:]
+            extra = " [yt-dlp: {}]".format(" | ".join(tail)) if tail else ""
+            return "the download ended" + extra
+        dead = [i + 1 for i, p in enumerate(self.ffplay_processes) if p.poll() is not None]
+        if dead:
+            return "player window(s) #{} exited".format(",".join(map(str, dead)))
+        return "an unknown reason"
+
+    def _terminate(self, join=True):
+        """Tear down the pipeline. The fast steps (signal + kill + close) run
+        under the lock; the (potentially blocking) thread joins run OUTSIDE the
+        lock and only when join=True - so the GUI thread (stop_video) never
+        blocks on them. Every process is KILLED BEFORE its stdin is closed, so a
+        writer blocked in stdin.write to a wedged pipe faults out immediately
+        (closing the write end alone would not unblock a process that stopped
+        reading; killing it makes the next write fail at once).
+        """
+        with self._lock:
+            if self._fanout_stop:
+                self._fanout_stop.set()
+            # Kill the download first (the fan-out reader then sees EOF).
+            if self.ytdlp_process:
+                _kill_tree(self.ytdlp_process)
+                self.ytdlp_process = None
+            # Kill each player, THEN close its stdin and wake any idle writer.
+            for c in self._consumers:
+                _kill_tree(c['proc'])
                 try:
-                    p.stdin.close()
+                    if c['proc'].stdin:
+                        c['proc'].stdin.close()
                 except Exception:
                     pass
-            _kill_tree(p)
-        self.ffplay_processes = []
+                try:
+                    c['q'].put_nowait(None)
+                except Exception:
+                    pass
+            for p in self.ffplay_processes:
+                _kill_tree(p)
+                if p.stdin:
+                    try:
+                        p.stdin.close()
+                    except Exception:
+                        pass
+            threads = ([self._fanout_thread, self._stderr_thread]
+                       + [c.get('thread') for c in self._consumers])
+            self.ffplay_processes = []
+            self._consumers = []
+            self._fanout_thread = None
+            self._fanout_stop = None
+            self._stderr_thread = None
+
+        if join:
+            cur = threading.current_thread()
+            for t in threads:
+                if t and t.is_alive() and t is not cur:
+                    t.join(timeout=2)
+                    if t.is_alive():
+                        log.warning("a worker thread did not exit within 2s; continuing")
 
     # ---- worker entry point ---------------------------------------------- #
+    def _wait_backoff(self, backoff):
+        waited = 0.0
+        while self.play_flag and waited < backoff:
+            time.sleep(0.25)
+            waited += 0.25
+
     def run(self):
         self.play_flag = True
         backoff = 3
         while self.play_flag:
-            self._start()
-            started = time.time()
-            self.app.post_ui(lambda: self.app.update_status(
-                "Playing '{}'".format(self.title), color='black'))
-            # Watch the handles we own - cheap and reliable.
-            while self.play_flag and self._alive():
-                time.sleep(0.4)
-            if not self.play_flag:
-                break
+            # The whole body is guarded: a failure to launch (missing tool mid
+            # run, a monitor-enumeration glitch, an exe-swap during self-heal)
+            # must fall through to the backoff/reconnect path, never kill the
+            # worker thread (which would freeze the UI with Play disabled).
+            try:
+                self._start()
+                if not self.play_flag:
+                    break
+                started = time.time()
+                announced = False
+                while self.play_flag and self._alive():
+                    if not announced and (time.time() - started) >= self.ANNOUNCE_AFTER:
+                        announced = True
+                        self.app.post_ui(lambda: self.app.update_status(
+                            "Playing '{}'".format(self.title), color='black'))
+                    time.sleep(0.4)
+                if not self.play_flag:
+                    break
+                ran_for = time.time() - started
+                reason = self._death_reason()
+            except Exception as e:
+                ran_for = 0.0
+                reason = "could not start playback: {}".format(e)
+                log.warning(reason)
+                # Don't promise a retry the auto-restart setting won't deliver.
+                will_retry = getattr(self.app, 'opt_auto_restart', True)
+                msg = ("Could not start playback - retrying..." if will_retry
+                       else "Could not start playback.")
+                self.app.post_ui(lambda m=msg: self.app.update_status(m, color='#b06a00'))
 
-            ran_for = time.time() - started
-            self._terminate()
+            self._terminate(join=True)
             if ran_for >= self.HEALTHY_SECONDS:
                 # A good long session: forget past failures.
                 backoff, self._fail_count, self._healed = 3, 0, False
 
             if not getattr(self.app, 'opt_auto_restart', True):
-                log.info("playback ended (ran %.0fs); auto-restart off -> stop", ran_for)
+                log.info("playback ended (ran %.0fs, %s); auto-restart off -> stop",
+                         ran_for, reason)
                 break
 
-            # Self-heal: repeated quick failures usually mean YouTube changed
-            # something, so update yt-dlp once (its maintainers ship the fix).
             self._fail_count += 1
-            log.info("playback dropped after %.0fs (failure #%d); backoff %ds",
-                     ran_for, self._fail_count, backoff)
+            log.info("playback dropped after %.0fs (%s; failure #%d); backoff %ds",
+                     ran_for, reason, self._fail_count, backoff)
+
+            # Self-heal: repeated quick failures usually mean YouTube changed
+            # something, so update yt-dlp (its maintainers ship the fix). Re-arm
+            # periodically so a fix shipped days into an outage is still picked
+            # up - not healed only once ever on a stream that never recovers.
+            if self._fail_count % self.REHEAL_EVERY == 0:
+                self._healed = False
             if self._fail_count >= self.HEAL_AFTER_FAILS and not self._healed:
                 self._healed = True
                 log.info("self-heal: updating yt-dlp after repeated failures")
                 self.app.update_yt_dlp(silent=True)
 
-            self.app.post_ui(lambda b=backoff: self.app.update_status(
-                "Reconnecting in {}s...".format(b), color='#b06a00'))
-            waited = 0.0
-            while self.play_flag and waited < backoff:
-                time.sleep(0.25)
-                waited += 0.25
-            backoff = min(backoff * 2, 30)  # exponential, capped
+            # Surface an explicit offline state instead of a forever-"Reconnecting"
+            # flicker, so a passer-by can tell the wall is down, not buffering.
+            if self._fail_count >= self.OFFLINE_AFTER_FAILS:
+                self.app.post_ui(lambda b=backoff: self.app.update_status(
+                    "Stream appears offline - retrying every {}s".format(b), color='#b06a00'))
+            else:
+                self.app.post_ui(lambda b=backoff: self.app.update_status(
+                    "Reconnecting in {}s...".format(b), color='#b06a00'))
 
-        self._terminate()
+            self._wait_backoff(backoff)
+            backoff = next_backoff(backoff)  # exponential, capped
+
+        self._terminate(join=True)
         self.app.post_ui(lambda: self.app._on_player_finished(self))
 
     def stop(self):
+        # Signal-only + fast (non-blocking) teardown, so the GUI thread never
+        # freezes on a thread join. The worker's own terminal _terminate(join=True)
+        # does the joins off the main thread.
         if self.play_flag:
             log.info("stop requested")
         self.play_flag = False
-        self._terminate()
+        self._terminate(join=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -515,6 +831,12 @@ class App(tk.Tk):
         self.create_menu()
         self.create_widgets()
         self.load_all_settings()
+        # Fixed control surface: a kiosk shouldn't be able to shrink the window
+        # and clip the Play/Stop buttons or status bar out of reach.
+        try:
+            self.resizable(False, False)
+        except Exception:
+            pass
         self.after(50, self._pump_ui_queue)
 
         if not self.url_entry.get():
@@ -554,8 +876,13 @@ class App(tk.Tk):
 
         tk.Label(self, text="Grid divisions:", font=("Helvetica", 12)).grid(
             row=3, column=1, padx=10, pady=10, sticky='w')
-        self.divisions_spinbox = tk.Spinbox(self, from_=1, to=64, increment=1, width=5)
+        vcmd = (self.register(self._validate_divisions), '%P')
+        self.divisions_spinbox = tk.Spinbox(self, from_=1, to=64, increment=1, width=5,
+                                            validate='key', validatecommand=vcmd)
         self.divisions_spinbox.grid(row=3, column=2, padx=10, pady=10, sticky='w')
+        # Clamp the visible value to what is actually used (1..64) on blur, so
+        # the box never shows a number we silently overrode.
+        self.divisions_spinbox.bind("<FocusOut>", lambda e: self._clamp_divisions_display())
 
         self.stop_button = tk.Button(self, text="■  Stop", command=self.stop_video,
                                      width=9, font=("Helvetica", 10), relief='flat',
@@ -600,9 +927,12 @@ class App(tk.Tk):
 
         self.url_entry.bind("<FocusOut>", lambda e: self.update_video_title())
         self.url_entry.bind("<Return>", lambda e: self.play_video())
-        self.bind_all("<Escape>", lambda e: self.stop_video())
-        self.bind_all("<F5>", lambda e: self.play_video())
-        self.bind_all("<space>", self._space_shortcut)
+        # Bind shortcuts to THIS window (not bind_all) so they don't leak into
+        # the modal monitor chooser / Identify overlays, where Esc/F5/space
+        # would otherwise fire playback actions behind the dialog.
+        self.bind("<Escape>", lambda e: self.stop_video())
+        self.bind("<F5>", lambda e: self.play_video())
+        self.bind("<space>", self._space_shortcut)
 
         for r in range(8):
             self.grid_rowconfigure(r, weight=1 if r == 0 else 0)
@@ -665,6 +995,7 @@ class App(tk.Tk):
         dlg.title("Select monitors")
         dlg.transient(self)
         dlg.grab_set()
+        dlg.bind("<Escape>", lambda e: dlg.destroy())  # Esc cancels the dialog
         tk.Label(dlg, text="Tick the monitors to use for tiled playback:",
                  font=("Helvetica", 11)).pack(padx=12, pady=(12, 6), anchor='w')
         rows = []
@@ -698,6 +1029,8 @@ class App(tk.Tk):
         btns.pack(pady=12)
         tk.Button(btns, text="OK", width=10, command=apply_sel).pack(side=tk.LEFT, padx=10)
         tk.Button(btns, text="Cancel", width=10, command=dlg.destroy).pack(side=tk.LEFT, padx=10)
+        # Apply the active theme so the chooser doesn't pop as a light-mode box.
+        self._style_subtree(dlg)
 
     def refresh_monitor_info(self):
         try:
@@ -760,7 +1093,11 @@ class App(tk.Tk):
             self.auto_restart_video.set(bool(data.get('auto_restart', True)))
             self.multi_monitor.set(bool(data.get('multi_monitor', False)))
             self.mute.set(bool(data.get('mute', False)))
+            # Only trust http(s) URLs from the settings file - a tampered file
+            # must not be able to plant a yt-dlp argument-injection payload that
+            # autoplay would then launch hands-free at the next login.
             urls = data.get('urls') or list(self.url_entry['values'])
+            urls = [u for u in urls if is_valid_stream_url(u)]
             if urls:
                 self.url_entry['values'] = urls
             if data.get('quality') in QUALITY_CHOICES:
@@ -770,7 +1107,7 @@ class App(tk.Tk):
             if data.get('theme') in self.THEMES:
                 self.theme_var.set(data['theme'])
                 self.apply_theme()
-            if data.get('url'):
+            if is_valid_stream_url(data.get('url')):
                 self.url_entry.set(data['url'])
         except Exception as e:
             log.warning("load settings failed: %s", e)
@@ -788,9 +1125,12 @@ class App(tk.Tk):
         self.apply_theme()
         self.save_all_settings()
 
-    def apply_theme(self, theme=None):
-        p = self.THEMES.get(theme or self.theme_var.get(), self.THEMES['Light'])
-        BG, FG, FIELD, SUB, SUB_FG = p['bg'], p['fg'], p['field'], p['sub'], p['sub_fg']
+    def _style_subtree(self, root):
+        """Apply the active palette to a widget tree (used for the main window
+        and for dialogs created later, e.g. the monitor chooser, so they don't
+        pop as a light-mode box in Dark theme)."""
+        p = self.THEMES.get(self.theme_var.get(), self.THEMES['Light'])
+        BG, FG, FIELD, SUB = p['bg'], p['fg'], p['field'], p['sub']
 
         def style_widget(w):
             cls = w.winfo_class()
@@ -799,6 +1139,8 @@ class App(tk.Tk):
                     w.configure(bg=BG, fg=FG)
                 elif cls in ("Frame", "Toplevel", "Tk"):
                     w.configure(bg=BG)
+                elif cls == "Button":
+                    w.configure(bg=SUB, fg=FG, activebackground=SUB, activeforeground=FG)
                 elif cls == "Checkbutton":
                     w.configure(bg=BG, fg=FG, selectcolor=FIELD,
                                 activebackground=BG, activeforeground=FG)
@@ -810,9 +1152,17 @@ class App(tk.Tk):
             for c in w.winfo_children():
                 style_widget(c)
 
+        style_widget(root)
+
+    def apply_theme(self, theme=None):
+        if theme:
+            self.theme_var.set(theme)
+        p = self.THEMES.get(self.theme_var.get(), self.THEMES['Light'])
+        BG, FG, FIELD, SUB, SUB_FG = p['bg'], p['fg'], p['field'], p['sub'], p['sub_fg']
+
         try:
             self.configure(bg=BG)
-            style_widget(self)
+            self._style_subtree(self)
             self.play_button.configure(bg=self.ACCENT, fg='white',
                                        activebackground=self.ACCENT_HOVER, activeforeground='white')
             self.stop_button.configure(bg=SUB, fg=SUB_FG, activebackground=SUB, activeforeground=SUB_FG)
@@ -834,6 +1184,7 @@ class App(tk.Tk):
         def worker():
             path = find_executable('yt-dlp')
             if not path:
+                log.warning("update yt-dlp: not found on PATH")
                 if not silent:
                     self.post_ui(lambda: messagebox.showwarning(
                         "Update yt-dlp", "yt-dlp was not found on PATH."))
@@ -843,10 +1194,35 @@ class App(tk.Tk):
                 res = subprocess.run([path, '-U'], capture_output=True, text=True,
                                      timeout=180, creationflags=CREATE_NO_WINDOW)
                 out = ((res.stdout or '') + (res.stderr or '')).strip()
-                self.post_ui(lambda: self.update_status("yt-dlp update finished."))
+                ok = res.returncode == 0
+                # `yt-dlp -U` only self-updates a STANDALONE binary. A pip /
+                # console-script install refuses it - detect that and update via
+                # pip instead, so the self-heal actually does something there.
+                # NOT in a frozen build: there sys.executable is video-tiler.exe
+                # (the PyInstaller bootloader ignores '-m pip' and would just
+                # re-launch a SECOND kiosk), so we tell the operator instead.
+                if not ok and _looks_like_pip_ytdlp(out):
+                    if getattr(sys, 'frozen', False):
+                        log.warning("yt-dlp is a pip/source install but this is a frozen "
+                                    "build - cannot pip-update; update yt-dlp manually")
+                    else:
+                        log.info("yt-dlp -U is a no-op on a pip install; updating via pip")
+                        self.post_ui(lambda: self.update_status("Updating yt-dlp (pip)...", color='#b06a00'))
+                        res = subprocess.run(
+                            [sys.executable, '-m', 'pip', 'install', '--upgrade', 'yt-dlp'],
+                            capture_output=True, text=True, timeout=300, creationflags=CREATE_NO_WINDOW)
+                        out = ((res.stdout or '') + (res.stderr or '')).strip()
+                        ok = res.returncode == 0
+                if ok:
+                    log.info("yt-dlp update finished ok")
+                else:
+                    log.warning("yt-dlp update FAILED (rc=%s): %s", res.returncode, out[-300:])
+                self.post_ui(lambda: self.update_status(
+                    "yt-dlp update finished." if ok else "yt-dlp update failed."))
                 if not silent:
                     self.post_ui(lambda: messagebox.showinfo("Update yt-dlp", out[-800:] or "Done."))
             except Exception as e:
+                log.warning("yt-dlp update error: %s", e)
                 self.post_ui(lambda: self.update_status("yt-dlp update failed."))
                 if not silent:
                     self.post_ui(lambda: messagebox.showwarning(
@@ -891,29 +1267,39 @@ class App(tk.Tk):
 
     def update_video_title(self, force=False):
         url = self.url_entry.get().strip()
-        if not url:
+        # Only probe http(s) URLs (also avoids running the extractor on junk).
+        if not is_valid_stream_url(url):
             return
         # Debounce: <FocusOut> fires often, so skip a refetch when the URL has
         # not changed since the last fetch we kicked off.
         if not force and url == self._last_title_url:
             return
         self._last_title_url = url
-        probe = Player(self, url, self._safe_divisions())
-        probe.fetch_title_async(lambda t: self.video_title_label.config(text=t))
+        # Fetch the title directly (no throwaway Player / executable scans).
+        fetch_title_async(self, url, lambda t: self.video_title_label.config(text=t))
+
+    def _validate_divisions(self, proposed):
+        """Spinbox key-validation: allow empty (mid-edit) or up to 3 digits."""
+        return proposed == '' or (proposed.isdigit() and len(proposed) <= 3)
+
+    def _clamp_divisions_display(self):
+        """Write the clamped 1..64 value back so the box matches what is used."""
+        d = self._safe_divisions()
+        if self.divisions_spinbox.get().strip() != str(d):
+            self.divisions_spinbox.delete(0, tk.END)
+            self.divisions_spinbox.insert(0, str(d))
 
     def _safe_divisions(self):
-        try:
-            return max(1, min(64, int(self.divisions_spinbox.get())))
-        except Exception:
-            return 3
+        return clamp_divisions(self.divisions_spinbox.get())
 
     def play_video(self):
         self.stop_video()
         url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showerror("URL", "Please enter a video URL.")
+        if not is_valid_stream_url(url):
+            messagebox.showerror("URL", "Please enter a valid http(s) video URL.")
             return
         divisions = self._safe_divisions()
+        self._clamp_divisions_display()
         self.save_all_settings()  # also syncs the runtime-option mirrors
         self.player = Player(self, url, divisions)
         if not self.player.tools_ok:
@@ -953,8 +1339,12 @@ class App(tk.Tk):
             "  3. Press Play (or Enter). Every tile shows the same live frame;\n"
             "     only ONE stream is downloaded.\n\n"
             "STOPPING\n"
-            "  The player is full screen - press Esc or 'q' on it, or Alt+Tab back\n"
-            "  here and press Stop.\n\n"
+            "  Single screen: the player is full screen - press Esc/'q' on it, or\n"
+            "  Alt+Tab back here and press Stop.\n"
+            "  Multi-monitor: the players cover this window, so click this app on\n"
+            "  the taskbar (or Alt+Tab to it) THEN press Esc/Stop. Closing one\n"
+            "  player window just relaunches the whole wall (it does NOT stop);\n"
+            "  turn off 'Auto Restart' first if you want closing a window to stop.\n\n"
             "MULTI-MONITOR\n"
             "  Tick 'Multi-monitor' and use 'Monitors...' to choose screens (e.g. 2\n"
             "  of 3). One download is fanned out to one window per screen.\n\n"
@@ -965,10 +1355,12 @@ class App(tk.Tk):
             "  Run-at-startup enable kiosk mode. Theme (View menu) and every choice\n"
             "  are remembered. Reconnect is automatic with backoff, and yt-dlp\n"
             "  self-updates after repeated failures (Tools > Update yt-dlp to force).\n\n"
+            "LOG\n"
+            "  Activity is logged to:\n  {log}\n\n"
             "PLATFORM\n"
             "  Tested on Windows; macOS/Linux supported on a best-effort basis.\n\n"
             "Version: {v}\nEmail: {e}\nWebsite: {w}".format(
-                v=PROGRAM_VERSION, e=AUTHOR_EMAIL, w=AUTHOR_WEBSITE)))
+                v=PROGRAM_VERSION, e=AUTHOR_EMAIL, w=AUTHOR_WEBSITE, log=LOG_FILE)))
 
     def on_closing(self):
         self.save_all_settings()

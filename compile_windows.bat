@@ -10,6 +10,7 @@ REM 2. Build (icon lives in src\img\app.ico). --windowed hides the console.
 pyinstaller --clean --noconfirm --onefile --windowed ^
     --icon "src\img\app.ico" ^
     --add-data "src\img;img" ^
+    --add-data "VERSION;." ^
     --name "video-tiler" ^
     "src\video-tiler.py"
 

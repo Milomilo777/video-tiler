@@ -5,7 +5,10 @@
 # (or next to src/video-tiler.py, or in a sibling "bin" folder). On macOS,
 # `brew install ffmpeg` provides all three.
 #
-# All packages below are pure cross-platform (no Windows-only deps).
+# All packages below are cross-platform. Binary wheels are published for
+# Windows/macOS/Linux; on an unusual platform/Python a missing wheel falls back
+# to a from-source build (psutil ships C extensions; screeninfo uses per-OS
+# backends), which needs a C toolchain.
 
 yt-dlp
 screeninfo

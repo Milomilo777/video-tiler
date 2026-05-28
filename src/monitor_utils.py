@@ -10,23 +10,49 @@ from screeninfo import get_monitors
 
 
 def list_monitors():
-    """Return all monitors as plain dicts, ordered by their x position (left to right)."""
+    """Return all monitors as plain dicts, ordered left-to-right by x position.
+
+    'index' is assigned AFTER the left-to-right sort, so it is the spatial
+    position (0 = left-most), which is far more stable across reboots / driver
+    updates / hotplug than the OS enumeration order would be - a saved monitor
+    selection then keeps pointing at the same physical screen.
+
+    get_monitors() can RAISE (e.g. ScreenInfoError on a headless / no-display /
+    RDP session, or a transient failure during a monitor hotplug), not just
+    return an empty list. We catch that so the single-display fallback below
+    always fires and the app/playback worker never crashes on detection.
+    """
+    try:
+        raw = list(get_monitors())
+    except Exception:
+        raw = []
+
+    mons = []
+    for m in raw:
+        try:
+            mons.append({
+                'x': int(m.x),
+                'y': int(m.y),
+                'width': int(m.width),
+                'height': int(m.height),
+                'name': (getattr(m, 'name', None) or ''),
+                'is_primary': bool(getattr(m, 'is_primary', False)),
+            })
+        except Exception:
+            pass
+
+    mons.sort(key=lambda mm: mm['x'])
     out = []
-    for i, m in enumerate(get_monitors()):
-        out.append({
-            'index': i,
-            'x': int(m.x),
-            'y': int(m.y),
-            'width': int(m.width),
-            'height': int(m.height),
-            'name': (getattr(m, 'name', None) or 'Display {}'.format(i + 1)),
-            'is_primary': bool(getattr(m, 'is_primary', False)),
-        })
+    for i, m in enumerate(mons):
+        m['index'] = i
+        if not m['name']:
+            m['name'] = 'Display {}'.format(i + 1)
+        out.append(m)
+
     if not out:
-        # Fallback so the app still runs if detection fails for any reason
+        # Fallback so the app still runs if detection fails for any reason.
         out.append({'index': 0, 'x': 0, 'y': 0, 'width': 1920, 'height': 1080,
                     'name': 'Display 1', 'is_primary': True})
-    out.sort(key=lambda mm: mm['x'])
     return out
 
 

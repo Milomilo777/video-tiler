@@ -50,7 +50,7 @@ else
   say "Tk $TKVER OK"
 fi
 
-# ---- venv + deps (requirements.txt skips the Windows-only packages here) ----
+# ---- venv + deps (requirements.txt is fully cross-platform) ----
 say "creating virtualenv at $VENV"
 rm -rf "$VENV"
 "$PY" -m venv "$VENV"
@@ -89,14 +89,18 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$VENV/bin:\$PATH"
 exec "$VENV/bin/python" "$REPO_ROOT/src/video-tiler.py"
 EOF
 chmod +x "$APP/Contents/MacOS/video-tiler"
-cat > "$APP/Contents/Info.plist" <<'EOF'
+# Single source of truth: read the version from the repo's VERSION file.
+APP_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+[ -z "$APP_VERSION" ] && APP_VERSION="1.1"
+cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Video Tiler</string>
   <key>CFBundleDisplayName</key><string>Video Tiler</string>
   <key>CFBundleIdentifier</key><string>com.suprememastertv.videotiler</string>
-  <key>CFBundleVersion</key><string>1.1</string>
+  <key>CFBundleVersion</key><string>${APP_VERSION}</string>
+  <key>CFBundleShortVersionString</key><string>${APP_VERSION}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>video-tiler</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>

@@ -19,7 +19,7 @@ hub). From a core i7, tiling can go up to 64×64 tiles.
 * Manual **quality** selector, **mute**, **auto-restart**, and **kiosk** options
   (auto-play on launch, run at Windows startup)
 * **Light / Dark theme** (your choice) and **all settings are remembered**
-* Keyboard shortcuts: `Esc` = stop, `F5` = play, `Space` = play/pause
+* Keyboard shortcuts: `Esc` = stop, `F5` = play, `Space` = play/stop
 * **Self-updating**: `Tools > Update yt-dlp`, an automatic yt-dlp update after
   repeated playback failures, and a non-intrusive "new version available" check
 * Cross-platform code (Windows tested; macOS/Linux best-effort)
@@ -56,6 +56,23 @@ a real Mac.)
    press **Stop**.
 4. For several screens: tick **Multi-monitor**, then **Monitors…** to choose
    which ones (the **Identify** button flashes each monitor's number).
+
+### Stopping a multi-monitor wall
+The per-screen players are borderless and on top, so they cover this window.
+To stop: click **Video Tiler** on the taskbar (or Alt+Tab to it), then press
+**Esc** or **Stop**. Closing a single player window does **not** stop playback —
+with **Auto Restart** on (the default) it just relaunches the whole wall; turn
+**Auto Restart** off first if you want closing a window to end playback.
+
+## Logs / troubleshooting
+Activity (start, drops, reconnect/backoff, self-heal, stop, and the last lines
+of yt-dlp's own error output) is written to a rotating `videotiler.log`:
+
+* **Windows:** `%LOCALAPPDATA%\videotiler\videotiler\videotiler.log`
+* **macOS:** `~/Library/Application Support/videotiler/videotiler.log`
+* **Fallback (no `appdirs`):** `~/.videotiler/videotiler.log`
+
+The exact path is also shown in **About → Help**.
 
 ## Architecture
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design (playback engine,
