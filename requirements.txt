@@ -1,0 +1,15 @@
+# Video Tiler dependencies
+# Install with:  pip install -r requirements.txt
+#
+# yt-dlp / ffmpeg / ffplay executables are NOT pip packages: put them on PATH
+# (or next to src/video-tiler.py, or in a sibling "bin" folder).
+
+yt-dlp
+screeninfo
+prettytable
+psutil
+appdirs
+
+# Windows-only helpers (window detection). Skipped automatically on macOS/Linux.
+pygetwindow ; sys_platform == "win32"
+pywin32 ; sys_platform == "win32"

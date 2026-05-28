@@ -4,3 +4,5 @@ __pycache__/
 *.pyo
 settings.json
 divisions.txt
+
+RUN - test the github version.bat

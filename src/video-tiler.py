@@ -14,9 +14,17 @@ import traceback
 import psutil  # For process handling
 import time
 import appdirs
-import pygetwindow as gw
-import win32process
+# Windows-only window-detection helpers; optional so the app still imports on macOS/Linux.
+try:
+    import pygetwindow as gw
+except Exception:
+    gw = None
+try:
+    import win32process
+except Exception:
+    win32process = None
 import json
+import urllib.request
 import monitor_utils
 
 
@@ -37,6 +45,9 @@ AUTHOR_WEBSITE = "https://github.com/translation-robot/video-tiler"
 WHY_TILING_URL = "https://suprememastertv.com/en1/v/245875177398.html"
 SUPPORTED_WEB_SITES = "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md"
 SOURCE_CODE_GITHUB = "https://github.com/translation-robot/video-tiler"
+# Update checking: a plain VERSION file in the repo, and the releases page to send users to.
+UPDATE_VERSION_URL = "https://raw.githubusercontent.com/translation-robot/video-tiler/master/VERSION"
+RELEASES_URL = "https://github.com/translation-robot/video-tiler/releases"
 
 json_configuration_url='https://raw.githubusercontent.com/translation-robot/video-tiler/main/src/configuration/configuration.json'
 
@@ -148,7 +159,7 @@ RUN_VALUE_NAME = "SMTV_VideoTiler"
 def _startup_launcher_path():
     """Absolute path to the launcher .bat that startup should run."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(repo_root, "RUN - test the github version.bat")
+    return os.path.join(repo_root, "run.bat")
 
 
 def set_run_at_startup(enabled):
@@ -436,11 +447,17 @@ class YouTubeVideo:
         start_time = time.time()
 
         def has_window(pid):
-            for window in gw.getAllWindows():
-                if window._hWnd:  # Ensure the window handle is valid
-                    _, window_pid = win32process.GetWindowThreadProcessId(window._hWnd)
-                    if window_pid == pid:
-                        return True
+            # Real window detection is Windows-only; on macOS/Linux treat a live player as visible.
+            if gw is None or win32process is None:
+                return True
+            try:
+                for window in gw.getAllWindows():
+                    if window._hWnd:  # Ensure the window handle is valid
+                        _, window_pid = win32process.GetWindowThreadProcessId(window._hWnd)
+                        if window_pid == pid:
+                            return True
+            except Exception:
+                return True
             return False
 
         while (time.time() - start_time) < timeout:
@@ -448,7 +465,7 @@ class YouTubeVideo:
             current_process = psutil.Process(current_pid)
 
             # Check for yt-dlp child processes
-            yt_dlp_exists = any(child.name() == 'yt-dlp.exe' for child in current_process.children(recursive=True))
+            yt_dlp_exists = any('yt-dlp' in (child.name() or '').lower() for child in current_process.children(recursive=True))
 
             if not yt_dlp_exists:
                 print("no yt-dlp process exists")
@@ -458,14 +475,14 @@ class YouTubeVideo:
             for child in current_process.children(recursive=True):
                 try:
                     # Check for yt-dlp child processes
-                    ffplay_exists = any(child.name() == 'ffplay.exe' for child in current_process.children(recursive=True))
+                    ffplay_exists = any('ffplay' in (child.name() or '').lower() for child in current_process.children(recursive=True))
 
                     if not ffplay_exists:
                         print("no yt-dlp process exists")
                         return False  # Return False immediately if no yt-dlp child process exists
                         
                     # Check if the child process is ffplay
-                    if child.name() == 'ffplay.exe':
+                    if 'ffplay' in (child.name() or '').lower():
                         if has_window(child.pid):  # Use child.pid to check for the window
                             return True
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -630,6 +647,15 @@ class YouTubeVideo:
                     
                     # If ffplay is not running but yt-dlp is, restart yt-dlp and ffplay
                     if not ffplay_alive:
+                        # Self-heal: a repeated failure usually means YouTube changed something,
+                        # so quietly update yt-dlp once (the GitHub-maintained fix) before retrying.
+                        self._fail_count = getattr(self, '_fail_count', 0) + 1
+                        if self._fail_count >= 2 and not getattr(self, '_healed', False):
+                            self._healed = True
+                            try:
+                                self.parent.update_yt_dlp(silent=True)
+                            except Exception:
+                                pass
                         #self.timer_window = TimerWindow(self, self.parent, title="Action Required", question="Video was stopped, do you want to restart it?", duration=10)
                         if self.parent.auto_restart_video.get() == True:
                             if self.play_flag == True:
@@ -755,6 +781,9 @@ class App(tk.Tk):
         # Kiosk: auto-start playback if the user enabled it
         if self.autoplay.get():
             self.after(2500, self.play_video)
+
+        # Quietly look for a newer version on launch (suggests only; never forces)
+        self.after(4000, lambda: self.check_for_updates(silent=True))
 
     def initialize_default_video(self):
         if not self.url_entry.get():
@@ -1102,6 +1131,12 @@ class App(tk.Tk):
         view_menu.add_cascade(label="Theme", menu=theme_menu, font=menu_font)
         menubar.add_cascade(label="View", menu=view_menu, font=menu_font_small)
 
+        # Tools menu: keep yt-dlp current and check for app updates
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Update yt-dlp now", command=self.update_yt_dlp, font=menu_font)
+        tools_menu.add_command(label="Check for updates", command=lambda: self.check_for_updates(False), font=menu_font)
+        menubar.add_cascade(label="Tools", menu=tools_menu, font=menu_font_small)
+
         menubar.add_cascade(label="About", menu=about_menu, font=menu_font_small)
 
         # Configure the menu bar with zero padding (if applicable)
@@ -1112,7 +1147,32 @@ class App(tk.Tk):
         self.save_all_settings()
         
     def show_help(self):
-        help_text = f"Program Version: {PROGRAM_VERSION}\nEmail: {AUTHOR_EMAIL}\nWebsite: {AUTHOR_WEBSITE}"
+        help_text = (
+            "HOW TO USE\n"
+            "  1. Pick or paste a video URL (YouTube, X, etc.).\n"
+            "  2. Set the grid size (e.g. 5 = a 5x5 grid of identical tiles).\n"
+            "  3. Press Play (or Enter). Every tile shows the same live frame;\n"
+            "     only ONE stream is downloaded.\n\n"
+            "STOPPING THE VIDEO\n"
+            "  The player opens full screen. Press Esc or 'q' on the video window,\n"
+            "  or Alt+Tab back to this window and press Stop.\n\n"
+            "MULTI-MONITOR\n"
+            "  Tick 'Multi-monitor' and use 'Monitors...' to choose which screens\n"
+            "  (e.g. 2 of 3). One download is fanned out to one window per screen.\n\n"
+            "KEYBOARD\n"
+            "  Esc = Stop    F5 = Play    Space = Play/Pause\n\n"
+            "OPTIONS\n"
+            "  Quality forces a resolution; Auto picks per tile size.\n"
+            "  Auto-play / Run at Windows startup enable kiosk mode.\n"
+            "  Theme (View menu) and every choice are remembered between launches.\n\n"
+            "UPDATES\n"
+            "  Tools > Update yt-dlp fixes most YouTube playback breakage.\n"
+            "  The app also updates yt-dlp automatically after repeated failures.\n\n"
+            "PLATFORM\n"
+            "  Tested on Windows. macOS/Linux are supported on a best-effort basis\n"
+            "  (window-focus detection is Windows-only and degrades gracefully).\n\n"
+            f"Version: {PROGRAM_VERSION}\nEmail: {AUTHOR_EMAIL}\nWebsite: {AUTHOR_WEBSITE}"
+        )
         messagebox.showinfo("Help", help_text)
 
     def open_why_tiling(self):
@@ -1180,6 +1240,59 @@ class App(tk.Tk):
 
     def update_status(self, message, color='black'):
         self.status_bar.config(text=f"Status: {message}", fg=color)
+
+    def update_yt_dlp(self, silent=False):
+        """Update the bundled yt-dlp executable. Runs in the background.
+
+        yt-dlp is the part that breaks when YouTube changes, so this is the main
+        self-repair. Also called automatically after repeated playback failures.
+        """
+        def worker():
+            path = find_executable('yt-dlp')
+            if not path:
+                if not silent:
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Update yt-dlp", "yt-dlp executable was not found on PATH."))
+                return
+            try:
+                self.after(0, lambda: self.update_status("Updating yt-dlp...", color='blue'))
+                res = subprocess.run([path, '-U'], capture_output=True, text=True, timeout=180)
+                out = ((res.stdout or '') + (res.stderr or '')).strip()
+                self.after(0, lambda: self.update_status("yt-dlp update finished."))
+                if not silent:
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Update yt-dlp", out[-800:] if out else "Done."))
+            except Exception as e:
+                self.after(0, lambda: self.update_status("yt-dlp update failed."))
+                if not silent:
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Update yt-dlp", "Update failed:\n{}".format(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def check_for_updates(self, silent=False):
+        """Check GitHub for a newer app version, then report and suggest (never forces)."""
+        def worker():
+            try:
+                req = urllib.request.Request(UPDATE_VERSION_URL, headers={'User-Agent': 'video-tiler'})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    remote = r.read().decode('utf-8', 'ignore').strip()
+            except Exception:
+                if not silent:
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Updates", "Could not reach the update server."))
+                return
+            if remote and remote != PROGRAM_VERSION:
+                def offer():
+                    if messagebox.askyesno(
+                            "Update available",
+                            "A newer version ({new}) is available (you have {cur}).\n\n"
+                            "Open the download page?".format(new=remote, cur=PROGRAM_VERSION)):
+                        webbrowser.open(RELEASES_URL)
+                self.after(0, offer)
+            elif not silent:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Updates", "You are on the latest version ({}).".format(PROGRAM_VERSION)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def load_saved_divisions(self):
         try:

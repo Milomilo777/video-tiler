@@ -1,25 +1,65 @@
 # Video Tiler
 ## _A video tiler designed for www.suprememastertv.com_
 
-## _Why a video tiler ?_
-Multiply the benefits of Supreme Master TV live stream:
+## _Why a video tiler?_
+Multiply the benefits of the Supreme Master TV live stream:
 https://suprememastertv.com/en1/v/245875177398.html
 
-## Features:
-* Graphical user interface to select any video URL, number of tiles and auto restart
-* Has list of SMTV streams (youtube, x.com, etc)
-* Auto restart video on error optional
-* Cross platform, will work on windows, linux and Mac
+One live stream is downloaded **once** and shown as an N×N grid of **identical**
+tiles, optionally across **multiple monitors** (e.g. a wall of TVs via an HDMI
+hub). From a core i7, tiling can go up to 64×64 tiles.
 
-From my core i7 processor, tiling can go up to 64x64 tiles
+## Features
+* Graphical interface to choose any video URL, the number of tiles, and auto-restart
+* Built-in list of SMTV streams (YouTube, X, etc.) and it remembers URLs you add
+* **Identical synchronized tiles** from a **single download** (light `fps*N²` method)
+* **Multi-monitor**: tile across all or selected screens (e.g. 2 of 3); one download
+  is fanned out to one player window per monitor (a single spanning window is
+  unreliable, so this uses one `ffplay` per screen)
+* Manual **quality** selector, **mute**, **auto-restart**, and **kiosk** options
+  (auto-play on launch, run at Windows startup)
+* **Light / Dark theme** (your choice) and **all settings are remembered**
+* Keyboard shortcuts: `Esc` = stop, `F5` = play, `Space` = play/pause
+* **Self-updating**: `Tools > Update yt-dlp`, an automatic yt-dlp update after
+  repeated playback failures, and a non-intrusive "new version available" check
+* Cross-platform code (Windows tested; macOS/Linux best-effort)
 
-## What is missing:
-* A version update checker
-* Instructions about using the tool, using alt-tab, esc to stop video etc
+## Requirements
+* Python 3.11+ (with Tk for the GUI)
+* `yt-dlp`, `ffmpeg`, and `ffplay` available on `PATH` (or next to `src/`, or in a
+  sibling `bin/` folder). On macOS, `brew install ffmpeg` provides all three.
+* Python packages: see `requirements.txt`
 
-## Problems:
-* Compiled with pyinstaller and can be detected as containing virus despite not having any (switch to other languages ?)
+## Run from source
+```bash
+pip install -r requirements.txt
+python src/video-tiler.py        # or double-click run.bat on Windows
+```
 
-## Download windows binaries
+## Build a Windows executable
+```bat
+compile_windows.bat
+```
+This installs the requirements + PyInstaller and produces a standalone `.exe`
+in `dist\` (icon: `src\img\app.ico`). Place `yt-dlp.exe`, `ffmpeg.exe` and
+`ffplay.exe` on `PATH` or next to the executable.
 
+## macOS
+See [`platform/macos/`](platform/macos/) for the installer, a double-clickable
+app bundle, and a Gatekeeper unblock helper. (Groundwork - not yet validated on
+a real Mac.)
+
+## How to use
+1. Pick or paste a video URL and set the grid size (e.g. `5` → a 5×5 grid).
+2. Press **Play** (or Enter). Every tile shows the same live frame.
+3. The player opens full screen - press `Esc`/`q` on it, or Alt+Tab back and
+   press **Stop**.
+4. For several screens: tick **Multi-monitor**, then **Monitors…** to choose
+   which ones (the **Identify** button flashes each monitor's number).
+
+## Problems
+* The PyInstaller build can be falsely flagged as a virus by some antivirus
+  engines despite containing none.
+
+## Download Windows binaries
 https://1drv.ms/u/c/25c35a16b8db8a90/EdKeHDg5-cxHvJYThwMSF5EBTtZlF8aWVQVJhSDBnC0LGw?e=BVbqYh
