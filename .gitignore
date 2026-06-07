@@ -5,4 +5,8 @@ __pycache__/
 settings.json
 divisions.txt
 
+# PyInstaller build artifacts (the exe is distributed via the download link, not git)
+build/
+dist/
+
 RUN - test the github version.bat

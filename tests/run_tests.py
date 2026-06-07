@@ -17,6 +17,10 @@ TEST_FILES = [
     "test_engine.py",
     "test_fanout.py",
     "test_settings.py",
+    "test_relaunch.py",
+    "test_stress.py",
+    "test_ffplay_flags.py",   # real ffmpeg/ffplay; self-skips if absent
+    "test_frontend.py",       # real Tk GUI; self-skips if no display
 ]
 
 

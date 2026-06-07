@@ -89,10 +89,34 @@ def test_atomic_write_leaves_no_tmp_and_is_valid():
     _with_tmp(body)
 
 
+def test_write_settings_does_not_fsync_on_hot_path():
+    # write_settings runs on the Tk main thread on every checkbox toggle and
+    # right before Play; a synchronous os.fsync there can stall the GUI for
+    # hundreds of ms on a slow/SMR laptop disk. It must NOT fsync (os.replace
+    # already gives crash-atomic visibility of the whole old OR whole new file).
+    def body():
+        called = {'fsync': False}
+        orig = vt.os.fsync
+
+        def boom(fd):
+            called['fsync'] = True
+            raise AssertionError("os.fsync must not be called on the GUI hot path")
+        vt.os.fsync = boom
+        try:
+            vt.write_settings({'divisions': 13})
+            persisted = vt.read_settings()['divisions'] == 13
+        finally:
+            vt.os.fsync = orig
+        check("write_settings persisted the value", persisted)
+        check("write_settings did NOT call os.fsync", called['fsync'] is False)
+    _with_tmp(body)
+
+
 if __name__ == '__main__':
     for fn in [test_roundtrip_merges_over_defaults, test_missing_file_is_defaults,
                test_corrupt_json_degrades_to_defaults, test_non_dict_json_ignored,
-               test_atomic_write_leaves_no_tmp_and_is_valid]:
+               test_atomic_write_leaves_no_tmp_and_is_valid,
+               test_write_settings_does_not_fsync_on_hot_path]:
         print(fn.__name__)
         fn()
     print()

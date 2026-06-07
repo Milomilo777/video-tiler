@@ -104,7 +104,7 @@ def test_fanout_copies_to_all_and_closes_dead_writer():
     source = io.BytesIO(payload)
     stop = threading.Event()
     p._fanout_stop = stop
-    p._fanout(source, stop, p._consumers)
+    p._fanout(source, stop)   # reads the live p._consumers list
 
     c_ok['thread'].join(2)
     c_bad['thread'].join(2)
@@ -117,7 +117,8 @@ def test_fanout_retires_a_wedged_consumer_instead_of_blocking():
     # One consumer wedges (never drains). The reader must retire it (queue full)
     # and finish feeding the healthy one, rather than blocking the whole wall.
     p = _make_player()
-    p.FANOUT_QUEUE_MAX = 4  # tiny, so the wedged queue fills fast
+    p.FANOUT_QUEUE_MAX = 4   # tiny, so the wedged queue fills fast
+    p.FANOUT_PUT_TIMEOUT = 1.0  # retire quickly so the test stays fast
     healthy = FakeStdin()
     wedged = FakeStdin(wedged=True)
     c_ok = {'proc': FakeProc(healthy), 'q': queue.Queue(maxsize=4), 'dead': False}
@@ -135,7 +136,7 @@ def test_fanout_retires_a_wedged_consumer_instead_of_blocking():
     done = threading.Event()
 
     def run_reader():
-        p._fanout(io.BytesIO(payload), stop, p._consumers)
+        p._fanout(io.BytesIO(payload), stop)   # reads the live p._consumers list
         done.set()
     threading.Thread(target=run_reader, daemon=True).start()
 

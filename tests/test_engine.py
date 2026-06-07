@@ -99,35 +99,99 @@ def test_ffplay_cmd_single_is_fullscreen():
     check("muted window gets -an", '-an' in single)
 
 
-def test_alive_requires_all_players():
-    class Dead:
-        def poll(self):
-            return 0
+class _Dead:
+    def poll(self):
+        return 0
 
-    class Live:
-        def poll(self):
-            return None
 
+class _Live:
+    def poll(self):
+        return None
+
+
+def _consumer(proc, dead=False, **extra):
+    c = {'proc': proc, 'dead': dead, 'index': extra.get('index', 0)}
+    c.update(extra)
+    return c
+
+
+def test_alive_requires_ytdlp_and_any_window():
+    # New semantics: the session is alive while the download runs AND at least
+    # one window still plays. A single dead/retired window no longer condemns the
+    # whole wall - run()'s supervisor relaunches it on its own.
     p = vt.Player(FakeApp(), "u", 2)
-    p.ytdlp_process = Live()
-    p.ffplay_processes = [Live(), Live()]
-    check("all players alive -> alive", p._alive() is True)
-    p.ffplay_processes = [Live(), Dead()]
-    check("one dead/retired player -> not alive (relaunch)", p._alive() is False)
-    p.ytdlp_process = Dead()
-    p.ffplay_processes = [Live(), Live()]
+    p.ytdlp_process = _Live()
+    p._consumers = [_consumer(_Live()), _consumer(_Live())]
+    check("download + all windows alive -> alive", p._alive() is True)
+    # One window retired (dead flag) while the other plays: STILL alive.
+    p._consumers = [_consumer(_Live()), _consumer(_Dead(), dead=True)]
+    check("one retired window -> wall still alive (targeted relaunch, no blink)",
+          p._alive() is True)
+    # Every window dead -> not alive (escalate to a full reconnect).
+    p._consumers = [_consumer(_Dead(), dead=True), _consumer(_Dead(), dead=True)]
+    check("all windows dead -> not alive", p._alive() is False)
+    # Dead download -> not alive regardless of the windows.
+    p.ytdlp_process = _Dead()
+    p._consumers = [_consumer(_Live())]
     check("dead download -> not alive", p._alive() is False)
-    p.ytdlp_process = Live()
-    p.ffplay_processes = []
-    check("no players -> not alive", p._alive() is False)
-    # A retired consumer (dead flag) must trip _alive immediately, without
-    # waiting for a wedged ffplay to notice EOF and exit.
-    p.ytdlp_process = Live()
-    p.ffplay_processes = [Live(), Live()]
-    p._consumers = [{'dead': False}, {'dead': True}]
-    check("a retired consumer -> not alive (even if its process still polls live)",
-          p._alive() is False)
+    # No windows at all -> not alive.
+    p.ytdlp_process = _Live()
     p._consumers = []
+    check("no windows -> not alive", p._alive() is False)
+
+
+def test_dead_window_indices():
+    p = vt.Player(FakeApp(), "u", 3)
+    p.ytdlp_process = _Live()
+    p._consumers = [_consumer(_Live(), index=0),                 # healthy
+                    _consumer(_Live(), dead=True, index=1),      # retired
+                    _consumer(_Dead(), index=2)]                 # exited on its own
+    check("retired + exited windows are flagged for relaunch",
+          p._dead_window_indices() == [1, 2])
+    p._consumers = [_consumer(_Live(), index=0), _consumer(_Live(), index=1)]
+    check("a fully healthy wall has no dead windows",
+          p._dead_window_indices() == [])
+
+
+def test_stall_watchdog():
+    # A silent freeze (no bytes for STALL_TIMEOUT while processes still look
+    # alive) must be detectable - poll() liveness alone cannot see it.
+    p = vt.Player(FakeApp(), "u", 2)
+    p._last_progress = vt.time.monotonic()
+    check("fresh data flow -> not stalled", p._stalled() is False)
+    p._last_progress = vt.time.monotonic() - (vt.Player.STALL_TIMEOUT + 1.0)
+    check("no data past STALL_TIMEOUT -> stalled (reconnect)", p._stalled() is True)
+    # With the download still 'alive' but silent, _death_reason names the stall.
+    p.ytdlp_process = _Live()
+    p._consumers = [_consumer(_Live())]
+    check("a stall is reported as the death reason",
+          "silent" in p._death_reason().lower())
+
+
+def test_ffplay_cmd_live_flags():
+    # The CPU/live-latency flags that keep a weak laptop near the live edge.
+    p = vt.Player(FakeApp(), "u", 3)
+    cmd = p._ffplay_cmd(FAKE[1], True, True)
+    check("-threads 0 (multicore decode) precedes the '-' input",
+          '-threads' in cmd and cmd[cmd.index('-threads') + 1] == '0'
+          and cmd.index('-threads') < cmd.index('-'))
+    check("-framedrop present (shed late frames -> stay near live, no drift)",
+          '-framedrop' in cmd)
+    check("still autoexits + stays quiet", '-autoexit' in cmd and '-hide_banner' in cmd)
+
+
+def test_ffplay_single_monitor_placement():
+    # A single PRIMARY-at-origin target uses true fullscreen.
+    p = vt.Player(FakeApp(), "u", 2)
+    prim = p._ffplay_cmd(FAKE[1], True, True)        # FAKE[1] is primary at x=0
+    check("single primary target -> -fs (true fullscreen)",
+          '-fs' in prim and '-noborder' not in prim)
+    # A single NON-primary target must be POSITIONED, not bare -fs (which would
+    # fullscreen on the primary screen instead).
+    nonprim = p._ffplay_cmd(FAKE[2], True, True)     # right monitor at x=2560
+    check("single non-primary target -> placed borderless window, not -fs",
+          '-fs' not in nonprim and '-noborder' in nonprim and '-left' in nonprim
+          and str(FAKE[2]['x']) in nonprim)
 
 
 # ---- URL validation (argument-injection guard) ---------------------------- #
@@ -217,7 +281,10 @@ def test_run_healthy_session_resets():
 
 if __name__ == '__main__':
     for fn in [test_yt_dlp_cmd, test_targets_uses_mirror_and_count,
-               test_ffplay_cmd_single_is_fullscreen, test_alive_requires_all_players,
+               test_ffplay_cmd_single_is_fullscreen, test_ffplay_cmd_live_flags,
+               test_ffplay_single_monitor_placement,
+               test_alive_requires_ytdlp_and_any_window, test_dead_window_indices,
+               test_stall_watchdog,
                test_url_validation, test_clamp_divisions, test_run_state_machine,
                test_run_healthy_session_resets]:
         print(fn.__name__)
