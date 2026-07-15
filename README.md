@@ -22,6 +22,20 @@ hub). From a core i7, tiling can go up to 64×64 tiles.
 * Keyboard shortcuts: `Esc` = stop, `F5` = play, `Space` = play/stop
 * **Self-updating**: `Tools > Update yt-dlp`, an automatic yt-dlp update after
   repeated playback failures, and a non-intrusive "new version available" check
+* **Kiosk-grade "never freeze" hardening** (v1.2):
+  * While the internet is down, a cheap connectivity probe replaces the
+    reconnect churn — nothing is spawned, and playback resumes within ~30 s of
+    the connection returning (even after hours offline)
+  * The machine is kept **awake** while a show is wanted (an unattended kiosk
+    that idled into Windows sleep looked "frozen forever")
+  * **Exact fullscreen on every monitor**, including mixed 125%/150% DPI
+    scaling (Per-Monitor-v2 awareness + a per-window geometry enforcer)
+  * Player windows open only once real data arrives (no black fullscreen
+    flashes on failed retries); a watchdog restarts a dead playback worker
+  * On weak CPUs, **Auto** quality steps down automatically when the machine
+    measurably cannot keep up (a manual quality choice is never overridden)
+  * Single-instance guard: run-at-startup plus a double-click can't run two
+    competing walls
 * Cross-platform code (Windows tested; macOS/Linux best-effort)
 
 ## Requirements

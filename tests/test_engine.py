@@ -37,6 +37,7 @@ FAKE = [
     {'index': 2, 'x': 2560, 'y': 0, 'width': 1920, 'height': 1080, 'name': 'R', 'is_primary': False},
 ]
 vt.monitor_utils.list_monitors = lambda: [dict(m) for m in FAKE]
+_ORIG_INTERNET_OK = vt.internet_ok   # run() tests stub it; keep the real one
 
 
 class FakeApp:
@@ -157,6 +158,7 @@ def test_stall_watchdog():
     # A silent freeze (no bytes for STALL_TIMEOUT while processes still look
     # alive) must be detectable - poll() liveness alone cannot see it.
     p = vt.Player(FakeApp(), "u", 2)
+    p._got_first_data = True          # mid-stream semantics (30s threshold)
     p._last_progress = vt.time.monotonic()
     check("fresh data flow -> not stalled", p._stalled() is False)
     p._last_progress = vt.time.monotonic() - (vt.Player.STALL_TIMEOUT + 1.0)
@@ -166,6 +168,23 @@ def test_stall_watchdog():
     p._consumers = [_consumer(_Live())]
     check("a stall is reported as the death reason",
           "silent" in p._death_reason().lower())
+
+
+def test_startup_stall_threshold_is_generous():
+    # Before the FIRST byte, the generous STARTUP threshold applies: extraction
+    # on a slow laptop + slow link can take >30s, and tripping the 30s stall
+    # there caused a reconnect-forever loop ("it never works").
+    p = vt.Player(FakeApp(), "u", 2)
+    check("startup threshold is longer than the mid-stream one",
+          vt.Player.STARTUP_STALL_TIMEOUT > vt.Player.STALL_TIMEOUT)
+    p._last_progress = vt.time.monotonic() - (vt.Player.STALL_TIMEOUT + 5.0)
+    check("31s of silence BEFORE any data -> not yet stalled", p._stalled() is False)
+    p._last_progress = vt.time.monotonic() - (vt.Player.STARTUP_STALL_TIMEOUT + 1.0)
+    check("past the startup threshold -> stalled", p._stalled() is True)
+    p.ytdlp_process = _Live()
+    p._consumers = []
+    check("the never-any-data case is reported distinctly",
+          "no data ever arrived" in p._death_reason().lower())
 
 
 def test_ffplay_cmd_live_flags():
@@ -219,6 +238,7 @@ def test_clamp_divisions():
 # ---- the reconnect / backoff / self-heal state machine -------------------- #
 def test_run_state_machine():
     app = FakeApp()
+    vt.internet_ok = lambda url, timeout=3.0: True   # tests never touch the net
     p = vt.Player(app, "http://x", 3)
     # Make every session fail instantly, with no real processes or sleeps.
     p._start = lambda: None
@@ -252,6 +272,7 @@ def test_run_state_machine():
 def test_run_healthy_session_resets():
     # A session that lasts >= HEALTHY_SECONDS must reset the failure/heal state.
     app = FakeApp()
+    vt.internet_ok = lambda url, timeout=3.0: True   # tests never touch the net
     p = vt.Player(app, "http://x", 3)
     p._fail_count = 5
     p._healed = True
@@ -279,14 +300,136 @@ def test_run_healthy_session_resets():
     check("healthy session re-armed self-heal (_healed False)", p._healed is False)
 
 
+# ---- connectivity gate: offline must probe, not churn --------------------- #
+def test_run_offline_gate_spawns_nothing_and_recovers():
+    # While the internet is down the reconnect loop must NOT count failures,
+    # NOT self-heal, and NOT keep launching the pipeline - it waits on a cheap
+    # probe. When the probe passes again, normal reconnection resumes.
+    app = FakeApp()
+    online = {'v': False}
+    vt.internet_ok = lambda url, timeout=3.0: online['v']
+    p = vt.Player(app, "http://x", 3)
+    starts = [0]
+
+    def fake_start():
+        starts[0] += 1
+    p._start = fake_start
+    p._terminate = lambda join=True: None
+    p._death_reason = lambda: "test"
+    waits = [0]
+
+    def fake_wait(seconds):
+        waits[0] += 1
+        if waits[0] == 6:
+            online['v'] = True          # the net comes back mid-loop
+        if waits[0] >= 9:
+            p.play_flag = False
+    p._wait_backoff = fake_wait
+
+    orig_sleep = vt.time.sleep
+    vt.time.sleep = lambda s: None
+    try:
+        p.run()
+    finally:
+        vt.time.sleep = orig_sleep
+
+    # Trace: start#1 fails -> offline -> 6 probe-waits (no launches, no failure
+    # counting) -> online -> start#2..#4 fail normally (3 counted failures, one
+    # self-heal at failure #2) -> stopped by the 9th wait.
+    check("offline probe-waits launched NOTHING (starts stayed at 1 while down)",
+          starts[0] == 4)
+    check("offline iterations did not count as stream failures",
+          p._fail_count == 3)
+    check("self-heal ran only while online", app.heals == 1)
+    check("an explicit no-internet status was shown",
+          any('internet' in m.lower() for m in app.status_msgs))
+    check("worker finished cleanly", app.finished is True)
+
+
+# ---- Auto-quality CPU-pressure step-down ----------------------------------- #
+def test_select_format_cpu_pressure():
+    sf = vt.select_format
+    check("pressure 0 keeps the Auto choice",
+          sf('Auto', 1, 0).startswith("best[height<=1080]"))
+    check("pressure 1 steps Auto down one rung (1080 -> 720)",
+          sf('Auto', 1, 1).startswith("best[height<=720]"))
+    check("pressure 2 steps Auto down two rungs (1080 -> 480)",
+          sf('Auto', 1, 2).startswith("best[height<=480]"))
+    check("pressure clamps at the lowest rung (144)",
+          sf('Auto', 64, 3).startswith("best[height<=144]"))
+    check("a MANUAL quality is never overridden by pressure",
+          sf('720p', 1, 3).startswith("best[height<=720]"))
+
+
+# ---- exact-fullscreen window geometry -------------------------------------- #
+def test_placed_window_gets_exact_monitor_size():
+    # A placed (non -fs) window must be the monitor's EXACT size - the
+    # tile-floored filter size can run a few px short and leave a desktop
+    # sliver ("not quite fullscreen" on some monitors).
+    p = vt.Player(FakeApp(multi=True), "u", 7)   # 7 divisions floors unevenly
+    cmd = p._ffplay_cmd(FAKE[0], False, True)    # left 1920x1080 monitor
+    check("-x carries the monitor's full width",
+          '-x' in cmd and cmd[cmd.index('-x') + 1] == '1920')
+    check("-y carries the monitor's full height",
+          '-y' in cmd and cmd[cmd.index('-y') + 1] == '1080')
+    check("-left/-top carry the monitor origin",
+          cmd[cmd.index('-left') + 1] == '-1920' and cmd[cmd.index('-top') + 1] == '0')
+
+
+# ---- connectivity helpers --------------------------------------------------- #
+def test_stream_host_and_jitter():
+    check("host extracted from the stream URL",
+          vt.stream_host("https://www.youtube.com/watch?v=abc") == "www.youtube.com")
+    check("garbage URL falls back to the default host",
+          vt.stream_host(None) == "www.youtube.com")
+    vals = [vt.jittered(30.0) for _ in range(200)]
+    check("jitter stays within [30, 37.5]",
+          all(30.0 <= v <= 30.0 * 1.25 for v in vals))
+    check("jitter actually varies", len({round(v, 6) for v in vals}) > 1)
+
+
+def test_internet_ok_uses_tcp_probe():
+    # NB: earlier run() tests stub vt.internet_ok, so probe the ORIGINAL.
+    probe = _ORIG_INTERNET_OK
+    calls = []
+    orig = vt.socket.create_connection
+
+    class _Sock:
+        def close(self):
+            pass
+
+    def fake_ok(addr, timeout=None):
+        calls.append(addr)
+        return _Sock()
+
+    def fake_fail(addr, timeout=None):
+        calls.append(addr)
+        raise OSError("unreachable")
+    try:
+        vt.socket.create_connection = fake_ok
+        check("first candidate reachable -> online after ONE probe",
+              probe("https://example.com/live") is True and len(calls) == 1
+              and calls[0][0] == "example.com")
+        calls.clear()
+        vt.socket.create_connection = fake_fail
+        check("all candidates unreachable -> offline",
+              probe("https://example.com/live") is False and len(calls) == 3)
+    finally:
+        vt.socket.create_connection = orig
+
+
 if __name__ == '__main__':
     for fn in [test_yt_dlp_cmd, test_targets_uses_mirror_and_count,
                test_ffplay_cmd_single_is_fullscreen, test_ffplay_cmd_live_flags,
                test_ffplay_single_monitor_placement,
                test_alive_requires_ytdlp_and_any_window, test_dead_window_indices,
-               test_stall_watchdog,
+               test_stall_watchdog, test_startup_stall_threshold_is_generous,
                test_url_validation, test_clamp_divisions, test_run_state_machine,
-               test_run_healthy_session_resets]:
+               test_run_healthy_session_resets,
+               test_run_offline_gate_spawns_nothing_and_recovers,
+               test_select_format_cpu_pressure,
+               test_placed_window_gets_exact_monitor_size,
+               test_stream_host_and_jitter, test_internet_ok_uses_tcp_probe]:
         print(fn.__name__)
         fn()
     print()

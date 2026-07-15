@@ -16,12 +16,15 @@ import sys
 import json
 import time
 import queue
+import random
 import shutil
+import socket
 import logging
 import threading
 import subprocess
 import webbrowser
 import collections
+import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
 
@@ -32,9 +35,10 @@ from tkinter import font as tkfont
 import yt_dlp
 import psutil
 
-# monitor_utils sits next to this file; ensure its folder is importable.
+# monitor_utils / winkiosk sit next to this file; ensure the folder is importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import monitor_utils
+import winkiosk
 
 
 # --------------------------------------------------------------------------- #
@@ -287,10 +291,20 @@ def set_run_at_startup(enabled):
 # --------------------------------------------------------------------------- #
 #  Format selection (pure - no network probe)
 # --------------------------------------------------------------------------- #
-def select_format(quality, divisions):
+AUTO_QUALITY_RUNGS = [1080, 720, 480, 360, 240, 144]
+
+
+def select_format(quality, divisions, cpu_pressure=0):
     """yt-dlp -f selector. Manual quality wins; Auto lowers resolution as the
     grid gets denser (a 50x50 tile needs far less than 1080p). Always ends in
-    /best so playback never fails just because a resolution is unavailable."""
+    /best so playback never fails just because a resolution is unavailable.
+
+    cpu_pressure (Auto only) steps the chosen height down one rung per level.
+    It is raised by the engine ONLY on measured evidence that this machine
+    cannot decode the current resolution (windows repeatedly wedging /
+    relaunch storms) - so a weak laptop degrades to a resolution it can
+    sustain instead of stuttering or freezing, while a capable machine keeps
+    full quality. A manual choice is never overridden."""
     heights = {'1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240, '144p': 144}
     h = heights.get(quality)
     if h is None:  # Auto: sparse grids want full resolution (a single tile fills
@@ -305,12 +319,55 @@ def select_format(quality, divisions):
             h = 240
         else:
             h = 144
+        if cpu_pressure > 0:
+            idx = AUTO_QUALITY_RUNGS.index(h) if h in AUTO_QUALITY_RUNGS else 0
+            h = AUTO_QUALITY_RUNGS[min(idx + int(cpu_pressure), len(AUTO_QUALITY_RUNGS) - 1)]
     return "best[height<={h}]/best[height<={h2}]/best".format(h=h, h2=h + 360)
 
 
 def next_backoff(prev, cap=30):
     """Exponential reconnect backoff, capped. Pure (so it is unit-testable)."""
     return min(prev * 2, cap)
+
+
+def jittered(seconds, frac=0.25):
+    """Add up to +frac random jitter to a wait, so thousands of retry cycles
+    never phase-lock with AV scans / other periodic load on a weak laptop."""
+    return seconds * (1.0 + random.uniform(0.0, frac))
+
+
+def stream_host(url, default="www.youtube.com"):
+    """Hostname of the stream URL (probe target), with a safe default."""
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+        return host or default
+    except Exception:
+        return default
+
+
+def internet_ok(url, timeout=3.0):
+    """Cheap connectivity probe: can we open a TCP connection to the stream's
+    host (or a well-known fallback)? Used to keep the reconnect loop from
+    churning the whole yt-dlp/ffplay pipeline for HOURS while the internet is
+    down - one SYN every probe interval instead of spawning and killing a
+    process tree, which is what wore weak laptops into a freeze. A false
+    "online" (captive portal) is harmless: the real attempt fails and backs
+    off exactly as before."""
+    candidates = [
+        (stream_host(url), 443),
+        ("1.1.1.1", 443),   # plain IP: works even while DNS is still down
+        ("8.8.8.8", 53),
+    ]
+    for host, port in candidates:
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+            sock.close()
+            return True
+        except OSError:
+            continue
+        except Exception:
+            continue
+    return False
 
 
 def clamp_divisions(raw, lo=1, hi=64, default=3):
@@ -398,9 +455,25 @@ class Player:
     # everything still *looks* alive (yt-dlp + its hidden ffmpeg still running,
     # ffplay still up), the pipeline has silently gone quiet - a freeze that
     # poll()-based liveness can never see. Treat it as a drop and reconnect.
-    # Comfortably longer than the HLS segment cadence and cold-start so a normal
-    # quiet gap between segment bursts never false-trips it.
+    # Comfortably longer than the HLS segment cadence so a normal quiet gap
+    # between segment bursts never false-trips it. Before the FIRST byte the
+    # startup threshold applies instead: extraction alone can take >30s on a
+    # slow laptop + slow link, and tripping at 30s there produced a
+    # reconnect-forever loop that looked like "it never works".
     STALL_TIMEOUT = 30.0
+    STARTUP_STALL_TIMEOUT = 90.0
+    # While the internet is down we probe (one TCP SYN) instead of launching
+    # the pipeline; this is how often. Cheap enough to keep small, so playback
+    # resumes within ~half a minute of connectivity returning.
+    OFFLINE_PROBE_INTERVAL = 30.0
+    # Measured CPU-overload learning (Auto quality only): if this many windows
+    # were retired as wedged within one session, or a window relaunch-storm
+    # escalated, the next session steps the Auto resolution down one rung.
+    WEDGES_TO_PRESSURE = 2
+    MAX_CPU_PRESSURE = 3
+    # Verify/enforce each placed window's rectangle after spawn (Windows).
+    # Class-level so tests that fake Popen can switch it off.
+    ENFORCE_RECT = (os.name == 'nt')
 
     def __init__(self, app, url, divisions):
         self.app = app
@@ -428,6 +501,11 @@ class Player:
         # silently voids the bounded-lifetime guarantee.
         self._pending_joins = []
         self._last_progress = 0.0   # monotonic time of the last bytes read from yt-dlp
+        self._got_first_data = False   # first byte seen this session (stall thresholds)
+        self._windows_spawned = False  # ffplay windows exist (they spawn on first data)
+        self._spawn_plan = None        # {'targets','single','muted'} for the deferred spawn
+        self._wedge_retires = 0        # windows retired as wedged this session (CPU signal)
+        self._cpu_pressure = 0         # sticky Auto-quality step-down (0..MAX_CPU_PRESSURE)
         self._fail_count = 0
         self._healed = False
 
@@ -452,7 +530,7 @@ class Player:
             '--extractor-args', 'youtube:player_client=' + YT_PLAYER_CLIENTS,
             '--no-warnings',
             '--retries', '10', '--socket-timeout', '15',
-            '-f', select_format(quality, self.divisions),
+            '-f', select_format(quality, self.divisions, self._cpu_pressure),
             '-o', '-',
             '--', self.url,
         ]
@@ -463,16 +541,24 @@ class Player:
         selected = list(getattr(self.app, 'selected_monitor_indices', []))
         return monitor_utils.select_monitors(monitors, selected, multi), multi
 
-    def _ffplay_cmd(self, mon, single, muted):
-        vf, ow, oh = monitor_utils.tile_filter_for(mon['width'], mon['height'], self.divisions)
-        # Placement: true fullscreen (-fs) ONLY when the lone target is the
-        # primary screen at the origin. ffplay's -fs fullscreens on whatever
-        # screen its window happens to open on (the primary), so a single
-        # NON-primary monitor must be positioned explicitly or playback lands on
-        # the wrong screen. Every wall window is a borderless placed window.
+    @staticmethod
+    def _uses_fs(mon, single):
+        """True when this target gets bare -fs: ONLY the lone primary screen at
+        the origin. ffplay's -fs fullscreens on whatever screen its window
+        happens to open on (the primary), so anything else must be a placed
+        borderless window or playback lands on the wrong screen."""
         primary_origin = bool(mon.get('is_primary')) or (
             mon.get('x', 0) == 0 and mon.get('y', 0) == 0)
-        win = ['-fs'] if (single and primary_origin) else monitor_utils.window_opts_for(mon, ow, oh)
+        return single and primary_origin
+
+    def _ffplay_cmd(self, mon, single, muted):
+        vf, _ow, _oh = monitor_utils.tile_filter_for(mon['width'], mon['height'], self.divisions)
+        # Placed windows get the monitor's EXACT size, not the tile-floored
+        # filter output (which can run a few px short of the screen and leave a
+        # desktop sliver - "not quite fullscreen"). ffplay letterboxes the
+        # <=2 px aspect difference invisibly.
+        win = (['-fs'] if self._uses_fs(mon, single)
+               else monitor_utils.window_opts_for(mon, mon['width'], mon['height']))
         audio = ['-an'] if muted else []
         # -threads 0 (auto): ffplay decodes single-threaded by DEFAULT, and
         #   software H.264 decode is the dominant CPU cost here - so on a weak
@@ -494,13 +580,37 @@ class Player:
         proc = subprocess.Popen(
             self._ffplay_cmd(mon, single, muted),
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW)
+            creationflags=CREATE_NO_WINDOW,
+            # SDL >= 2.24 honours this and applies our physical-pixel geometry
+            # 1:1 on scaled (125%/150%) monitors; older builds ignore it and
+            # the rect enforcer below corrects them instead.
+            env=winkiosk.sdl_child_env())
         c = {'proc': proc, 'q': queue.Queue(maxsize=self.FANOUT_QUEUE_MAX),
              'mon': mon, 'index': index, 'single': single, 'muted': muted,
              'dead': False, 'full_since': None, 'restarts': 0, 'first_restart': 0.0}
         c['thread'] = threading.Thread(target=self._consumer_writer, args=(c,), daemon=True)
         c['thread'].start()
+        if self.ENFORCE_RECT and not self._uses_fs(mon, single):
+            self._enforce_rect_async(c)
         return c
+
+    def _enforce_rect_async(self, c):
+        """Verify (and if needed force) this window to exactly cover its
+        monitor, off the spawning thread. Bounded, daemon, and it aborts as
+        soon as the window is retired/killed - so teardown never waits on it."""
+        mon, proc = c['mon'], c['proc']
+
+        def still_wanted():
+            return (not c.get('dead')) and proc.poll() is None and self.play_flag
+
+        def worker():
+            try:
+                winkiosk.enforce_window_rect(
+                    proc.pid, mon['x'], mon['y'], mon['width'], mon['height'],
+                    attempts=10, interval=1.0, still_wanted=still_wanted)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start(self):
         self._terminate(join=True)   # clean slate (handles any previous run)
@@ -534,48 +644,44 @@ class Player:
                                          args=(ytdlp.stderr, stderr_tail), daemon=True)
         stderr_thread.start()
 
-        consumers, stop_event, fanout_thread = [], None, None
+        # The ffplay windows are NOT spawned here. They spawn on the FIRST byte
+        # of real data (see _fanout/_spawn_windows): a launch that never yields
+        # data (internet down, bad URL, YouTube hiccup) then costs one yt-dlp
+        # process and zero windows - no black fullscreen wall flashing on every
+        # retry, and an order of magnitude less process churn on a weak laptop.
+        stop_event = threading.Event()
         try:
-            # EVERY monitor - even a single one - is fed through its own bounded
-            # queue + writer thread (never wired straight to yt-dlp's stdout).
-            # That ring buffer smooths HLS segment bursts and brief render
-            # hiccups, and it is what lets the fan-out notice a wedged ffplay
-            # (one that stays full) and the supervisor relaunch just that window.
-            # Only the first window keeps audio (rest get -an) to avoid echo.
-            stop_event = threading.Event()
-            for i, mon in enumerate(targets):
-                consumers.append(self._build_consumer(mon, i, single, muted or i > 0))
-            # Arm the stall watchdog from launch, so cold-start counts against it
-            # but a normal startup (first bytes within STALL_TIMEOUT) does not trip.
+            # Arm the stall watchdog from launch, so cold-start counts against
+            # it (with the more generous STARTUP threshold until data flows).
             self._last_progress = time.monotonic()
+            self._got_first_data = False
+            self._windows_spawned = False
             fanout_thread = threading.Thread(
                 target=self._fanout, args=(ytdlp.stdout, stop_event), daemon=True)
-            fanout_thread.start()
         except Exception:
-            if stop_event:
-                stop_event.set()
+            stop_event.set()
             _kill_tree(ytdlp)
-            for c in consumers:
-                _kill_tree(c['proc'])
             raise
 
-        # Publish under the lock. If a Stop landed during the launch, tear the
-        # freshly-built pipeline down instead of leaving it orphaned.
+        # Publish under the lock, THEN start the reader (so the spawn hook in
+        # _fanout always sees the published pipeline). If a Stop landed during
+        # the launch, tear the fresh pipeline down instead of orphaning it.
         with self._lock:
             published = self.play_flag
             if published:
                 self.ytdlp_process = ytdlp
                 self._stderr_tail = stderr_tail
                 self._stderr_thread = stderr_thread
-                self._consumers = consumers
-                self.ffplay_processes = [c['proc'] for c in consumers]
+                self._consumers = []
+                self.ffplay_processes = []
+                self._spawn_plan = {'targets': targets, 'single': single, 'muted': muted}
                 self._fanout_stop = stop_event
                 self._fanout_thread = fanout_thread
         if not published:
             stop_event.set()
             _kill_tree(ytdlp)
-            for c in consumers:
-                _kill_tree(c['proc'])
+            return
+        fanout_thread.start()
 
     def _drain_stderr(self, stream, tail):
         """Keep the last lines of a subprocess's stderr for diagnosis."""
@@ -603,6 +709,54 @@ class Player:
         except Exception:
             pass
 
+    def _spawn_windows(self, stop_event):
+        """Deferred window spawn: build every ffplay window the moment the FIRST
+        byte of real data arrives (called from the fan-out thread). Returns True
+        if the wall is (already) up. Building outside the lock (Popen cost),
+        publishing under it; if a Stop/teardown raced in, the fresh windows are
+        killed instead of published."""
+        with self._lock:
+            if self._consumers:            # already up (or a test pre-built them)
+                self._windows_spawned = True
+                return True
+            plan = self._spawn_plan
+            if plan is None or not self.play_flag:
+                return bool(self._consumers)
+
+        consumers = []
+        try:
+            # Only the first window keeps audio (rest get -an) to avoid echo.
+            for i, mon in enumerate(plan['targets']):
+                consumers.append(self._build_consumer(
+                    mon, i, plan['single'], plan['muted'] or i > 0))
+        except Exception as e:
+            log.warning("could not spawn the player window(s): %s", e)
+            for c in consumers:
+                _kill_tree(c['proc'])
+                try:
+                    c['q'].put_nowait(None)
+                except Exception:
+                    pass
+            return False
+
+        with self._lock:
+            ok = (self.play_flag and self.ytdlp_process is not None
+                  and self._fanout_stop is stop_event and not stop_event.is_set())
+            if ok:
+                self._consumers = consumers
+                self.ffplay_processes = [c['proc'] for c in consumers]
+                self._windows_spawned = True
+        if not ok:
+            for c in consumers:
+                _kill_tree(c['proc'])
+                try:
+                    c['q'].put_nowait(None)
+                except Exception:
+                    pass
+            return False
+        log.info("first data arrived; spawned %d window(s)", len(consumers))
+        return True
+
     def _fanout(self, source, stop_event):
         """Reader: copy the one download into every live consumer's queue. Bytes
         are NEVER dropped (that would corrupt a window's container); a window that
@@ -610,7 +764,8 @@ class Player:
         FANOUT_PUT_TIMEOUT, is RETIRED (killed). Retired/dead windows are skipped
         and the supervisor in run() relaunches them ON THEIR OWN. Reads the live
         consumer list each chunk (under the lock) so a relaunched window is picked
-        up without restarting the reader.
+        up without restarting the reader. The windows themselves are spawned on
+        the FIRST chunk (see _spawn_windows).
         """
         try:
             while not stop_event.is_set():
@@ -618,6 +773,10 @@ class Player:
                 if not chunk:
                     break                      # yt-dlp ended -> full reconnect
                 self._last_progress = time.monotonic()   # feed the stall watchdog
+                self._got_first_data = True
+                if not self._windows_spawned:
+                    if not self._spawn_windows(stop_event):
+                        break                  # spawn failed/raced -> reconnect
                 with self._lock:
                     consumers = list(self._consumers)
                 if not consumers:
@@ -659,6 +818,7 @@ class Player:
                     log.warning("fan-out: window #%d fell behind; retiring it "
                                 "(it will be relaunched on its own)",
                                 c.get('index', 0) + 1)
+                    self._wedge_retires += 1   # CPU-overload evidence (see run())
                     self._retire(c)
                     return False
         return False
@@ -697,10 +857,14 @@ class Player:
                    for c in self._consumers)
 
     def _stalled(self):
-        """True if no bytes have arrived from the download for STALL_TIMEOUT while
-        everything still looks alive - a silent freeze (e.g. yt-dlp's hidden HLS
-        ffmpeg wedged on a stalled segment) that poll() liveness cannot detect."""
-        return (time.monotonic() - self._last_progress) > self.STALL_TIMEOUT
+        """True if no bytes have arrived from the download for the stall
+        threshold while everything still looks alive - a silent freeze (e.g.
+        yt-dlp's hidden HLS ffmpeg wedged on a stalled segment) that poll()
+        liveness cannot detect. Until the FIRST byte the generous startup
+        threshold applies (extraction on a slow laptop + slow link can
+        legitimately take longer than a mid-stream gap ever should)."""
+        limit = self.STALL_TIMEOUT if self._got_first_data else self.STARTUP_STALL_TIMEOUT
+        return (time.monotonic() - self._last_progress) > limit
 
     def _dead_window_indices(self):
         """Indices of windows that were retired (dead flag) or whose ffplay
@@ -762,6 +926,9 @@ class Player:
             extra = " [yt-dlp: {}]".format(" | ".join(tail)) if tail else ""
             return "the download ended" + extra
         if self._stalled():
+            if not self._got_first_data:
+                return "no data ever arrived (waited {:.0f}s)".format(
+                    self.STARTUP_STALL_TIMEOUT)
             return "the stream went silent (no data for {:.0f}s)".format(self.STALL_TIMEOUT)
         dead = sorted({c.get('index', i) + 1 for i, c in enumerate(self._consumers)
                        if c.get('dead') or c['proc'].poll() is not None})
@@ -809,6 +976,7 @@ class Player:
                        + [c.get('thread') for c in self._consumers])
             self.ffplay_processes = []
             self._consumers = []
+            self._spawn_plan = None      # a raced deferred spawn must not publish
             self._fanout_thread = None
             self._fanout_stop = None
             self._stderr_thread = None
@@ -842,97 +1010,160 @@ class Player:
     def run(self):
         self.play_flag = True
         backoff = 3
-        while self.play_flag:
-            # The whole body is guarded: a failure to launch (missing tool mid
-            # run, a monitor-enumeration glitch, an exe-swap during self-heal)
-            # must fall through to the backoff/reconnect path, never kill the
-            # worker thread (which would freeze the UI with Play disabled).
-            try:
-                self._start()
-                if not self.play_flag:
-                    break
-                started = time.time()
-                announced = False
+        try:
+            while self.play_flag:
                 escalated = False
-                # Supervise: keep the download + every window alive. A single
-                # fallen window is relaunched ON ITS OWN so the rest of the wall
-                # never blinks; we escalate to a full reconnect only if the
-                # download dies, every window dies, or one window keeps dying
-                # (a screen that simply cannot play this stream).
-                while self.play_flag:
-                    if not self.ytdlp_process or self.ytdlp_process.poll() is not None:
-                        break                     # download ended
-                    if self._stalled():
-                        log.info("no data for %.0fs while still 'alive' -> "
-                                 "treating as a stall and reconnecting", self.STALL_TIMEOUT)
-                        break                     # silent freeze -> reconnect
-                    dead = self._dead_window_indices()
-                    if dead:
-                        for i in dead:
-                            if not self._relaunch_consumer(i):
-                                escalated = True
-                        if escalated:
-                            break
-                    if not self._consumers:
+                # The whole body is guarded: a failure to launch (missing tool mid
+                # run, a monitor-enumeration glitch, an exe-swap during self-heal)
+                # must fall through to the backoff/reconnect path, never kill the
+                # worker thread (which would freeze the UI with Play disabled).
+                try:
+                    self._start()
+                    if not self.play_flag:
                         break
-                    if not announced and (time.time() - started) >= self.ANNOUNCE_AFTER:
-                        announced = True
-                        self.app.post_ui(lambda: self.app.update_status(
-                            "Playing '{}'".format(self.title), color='black'))
-                    time.sleep(0.4)
-                if not self.play_flag:
+                    started = time.time()
+                    announced = False
+                    # Supervise: keep the download + every window alive. A single
+                    # fallen window is relaunched ON ITS OWN so the rest of the wall
+                    # never blinks; we escalate to a full reconnect only if the
+                    # download dies, every window dies, or one window keeps dying
+                    # (a screen that simply cannot play this stream).
+                    while self.play_flag:
+                        if not self.ytdlp_process or self.ytdlp_process.poll() is not None:
+                            break                     # download ended
+                        if self._stalled():
+                            log.info("no data while still 'alive' -> treating as "
+                                     "a stall and reconnecting")
+                            break                     # silent freeze -> reconnect
+                        dead = self._dead_window_indices()
+                        if dead:
+                            for i in dead:
+                                if not self._relaunch_consumer(i):
+                                    escalated = True
+                            if escalated:
+                                break
+                        # Windows only exist once the first data arrived; before
+                        # that the stall watchdog bounds the wait.
+                        if self._windows_spawned and not self._consumers:
+                            break
+                        if (not announced and self._windows_spawned
+                                and (time.time() - started) >= self.ANNOUNCE_AFTER):
+                            announced = True
+                            self.app.post_ui(lambda: self.app.update_status(
+                                "Playing '{}'".format(self.title), color='black'))
+                        time.sleep(0.4)
+                    if not self.play_flag:
+                        break
+                    ran_for = time.time() - started
+                    reason = self._death_reason()
+                except Exception as e:
+                    ran_for = 0.0
+                    reason = "could not start playback: {}".format(e)
+                    log.warning(reason)
+                    # Don't promise a retry the auto-restart setting won't deliver.
+                    will_retry = getattr(self.app, 'opt_auto_restart', True)
+                    msg = ("Could not start playback - retrying..." if will_retry
+                           else "Could not start playback.")
+                    self.app.post_ui(lambda m=msg: self.app.update_status(m, color='#b06a00'))
+
+                try:
+                    self._terminate(join=True)
+                except Exception:
+                    log.exception("teardown failed; continuing to the reconnect path")
+
+                # Measured CPU-overload learning (Auto quality only): windows that
+                # repeatedly wedge (queue full -> retired) or a relaunch storm
+                # mean THIS machine cannot decode the current resolution. Step
+                # the Auto quality down one rung for the next session so a weak
+                # laptop settles at a rate it can sustain instead of looping.
+                if self._wedge_retires >= self.WEDGES_TO_PRESSURE or escalated:
+                    if getattr(self.app, 'opt_quality', 'Auto') == 'Auto':
+                        if self._cpu_pressure < self.MAX_CPU_PRESSURE:
+                            self._cpu_pressure += 1
+                            log.info("windows kept falling behind (wedges=%d, "
+                                     "escalated=%s); lowering Auto quality one rung "
+                                     "(pressure %d/%d)", self._wedge_retires, escalated,
+                                     self._cpu_pressure, self.MAX_CPU_PRESSURE)
+                    else:
+                        log.info("windows kept falling behind but quality is fixed "
+                                 "at %s; consider a lower manual quality or Auto",
+                                 getattr(self.app, 'opt_quality', '?'))
+                self._wedge_retires = 0
+
+                if ran_for >= self.HEALTHY_SECONDS:
+                    # A good long session: forget past failures. (_cpu_pressure is
+                    # deliberately sticky: it reflects the hardware, not the network.)
+                    backoff, self._fail_count, self._healed = 3, 0, False
+
+                if not getattr(self.app, 'opt_auto_restart', True):
+                    log.info("playback ended (ran %.0fs, %s); auto-restart off -> stop",
+                             ran_for, reason)
                     break
-                ran_for = time.time() - started
-                reason = self._death_reason()
-            except Exception as e:
-                ran_for = 0.0
-                reason = "could not start playback: {}".format(e)
-                log.warning(reason)
-                # Don't promise a retry the auto-restart setting won't deliver.
-                will_retry = getattr(self.app, 'opt_auto_restart', True)
-                msg = ("Could not start playback - retrying..." if will_retry
-                       else "Could not start playback.")
-                self.app.post_ui(lambda m=msg: self.app.update_status(m, color='#b06a00'))
 
-            self._terminate(join=True)
-            if ran_for >= self.HEALTHY_SECONDS:
-                # A good long session: forget past failures.
-                backoff, self._fail_count, self._healed = 3, 0, False
+                # Connectivity gate: while the internet is DOWN, probe with one
+                # TCP SYN per interval instead of launching + killing the whole
+                # yt-dlp/ffplay pipeline over and over. Hours of outage then cost
+                # nothing (no process churn, no psutil scans, no window flashes,
+                # no pointless yt-dlp self-updates), and playback resumes within
+                # one probe interval of the connection returning.
+                if not internet_ok(self.url):
+                    log.info("no internet connectivity (probe failed); probing "
+                             "every ~%.0fs - nothing is spawned while offline",
+                             self.OFFLINE_PROBE_INTERVAL)
+                    self.app.post_ui(lambda: self.app.update_status(
+                        "No internet connection - waiting for it to return...",
+                        color='#b06a00'))
+                    while self.play_flag:
+                        self._wait_backoff(jittered(self.OFFLINE_PROBE_INTERVAL))
+                        if internet_ok(self.url):
+                            break
+                    if not self.play_flag:
+                        break
+                    log.info("connectivity restored; reconnecting now")
+                    continue
 
-            if not getattr(self.app, 'opt_auto_restart', True):
-                log.info("playback ended (ran %.0fs, %s); auto-restart off -> stop",
-                         ran_for, reason)
-                break
+                self._fail_count += 1
+                log.info("playback dropped after %.0fs (%s; failure #%d); backoff %ds",
+                         ran_for, reason, self._fail_count, backoff)
 
-            self._fail_count += 1
-            log.info("playback dropped after %.0fs (%s; failure #%d); backoff %ds",
-                     ran_for, reason, self._fail_count, backoff)
+                # Self-heal: repeated quick failures WHILE ONLINE usually mean
+                # YouTube changed something, so update yt-dlp (its maintainers
+                # ship the fix). Re-arm periodically so a fix shipped days into
+                # an outage is still picked up - not healed only once ever on a
+                # stream that never recovers. The connectivity gate above means
+                # this never runs while offline (an offline `yt-dlp -U` is
+                # useless churn and, interrupted, can corrupt the binary - after
+                # which playback never works again even when the net returns).
+                if self._fail_count % self.REHEAL_EVERY == 0:
+                    self._healed = False
+                if self._fail_count >= self.HEAL_AFTER_FAILS and not self._healed:
+                    self._healed = True
+                    log.info("self-heal: updating yt-dlp after repeated failures")
+                    self.app.update_yt_dlp(silent=True)
 
-            # Self-heal: repeated quick failures usually mean YouTube changed
-            # something, so update yt-dlp (its maintainers ship the fix). Re-arm
-            # periodically so a fix shipped days into an outage is still picked
-            # up - not healed only once ever on a stream that never recovers.
-            if self._fail_count % self.REHEAL_EVERY == 0:
-                self._healed = False
-            if self._fail_count >= self.HEAL_AFTER_FAILS and not self._healed:
-                self._healed = True
-                log.info("self-heal: updating yt-dlp after repeated failures")
-                self.app.update_yt_dlp(silent=True)
+                # Surface an explicit offline state instead of a forever-"Reconnecting"
+                # flicker, so a passer-by can tell the wall is down, not buffering.
+                if self._fail_count >= self.OFFLINE_AFTER_FAILS:
+                    self.app.post_ui(lambda b=backoff: self.app.update_status(
+                        "Stream appears offline - retrying every {}s".format(b), color='#b06a00'))
+                else:
+                    self.app.post_ui(lambda b=backoff: self.app.update_status(
+                        "Reconnecting in {}s...".format(b), color='#b06a00'))
 
-            # Surface an explicit offline state instead of a forever-"Reconnecting"
-            # flicker, so a passer-by can tell the wall is down, not buffering.
-            if self._fail_count >= self.OFFLINE_AFTER_FAILS:
-                self.app.post_ui(lambda b=backoff: self.app.update_status(
-                    "Stream appears offline - retrying every {}s".format(b), color='#b06a00'))
-            else:
-                self.app.post_ui(lambda b=backoff: self.app.update_status(
-                    "Reconnecting in {}s...".format(b), color='#b06a00'))
-
-            self._wait_backoff(backoff)
-            backoff = next_backoff(backoff)  # exponential, capped
-
-        self._terminate(join=True)
-        self.app.post_ui(lambda: self.app._on_player_finished(self))
+                self._wait_backoff(jittered(backoff))
+                backoff = next_backoff(backoff)  # exponential, capped
+        except Exception:
+            # Belt-and-braces: run() must NEVER die silently (a dead worker with
+            # play_flag still set is a black wall forever). Anything reaching
+            # here is a bug; log it loudly and end the session cleanly - the
+            # App-level watchdog restarts playback.
+            log.exception("player worker crashed unexpectedly")
+        finally:
+            try:
+                self._terminate(join=True)
+            except Exception:
+                log.exception("final teardown failed")
+            self.app.post_ui(lambda: self.app._on_player_finished(self))
 
     def stop(self, join=False):
         # Signal + teardown. play_flag is cleared synchronously (cheap) so the
@@ -1023,8 +1254,45 @@ class App(tk.Tk):
         self.update_video_title()
 
         if self.autoplay.get():
-            self.after(2500, self.play_video)
+            self.after(2500, lambda: self.play_video(from_autoplay=True))
         self.after(4000, lambda: self.check_for_updates(silent=True))
+        # Kiosk watchdog: if the worker thread ever dies while playback is
+        # wanted (should be impossible - run() is hardened - but a kiosk must
+        # survive even "impossible"), restart playback instead of showing a
+        # black wall forever. Also log health metrics so a field freeze report
+        # comes with evidence (memory/threads growth) instead of guesswork.
+        self.after(60000, self._watchdog_tick)
+        self.after(600000, self._log_health)
+
+    # ---- kiosk watchdog + health telemetry -------------------------------- #
+    def _watchdog_tick(self):
+        if getattr(self, '_closing', False):
+            return
+        try:
+            if (self.play_flag and self.player is not None
+                    and self.video_thread is not None
+                    and not self.video_thread.is_alive()):
+                log.error("watchdog: playback wanted but the worker thread is "
+                          "dead; restarting playback")
+                self.play_video(from_autoplay=True)
+        except Exception:
+            log.exception("watchdog tick failed")
+        self.after(60000, self._watchdog_tick)
+
+    def _log_health(self):
+        if getattr(self, '_closing', False):
+            return
+        try:
+            proc = psutil.Process()
+            with proc.oneshot():
+                rss_mb = proc.memory_info().rss / (1024 * 1024)
+                n_threads = proc.num_threads()
+                handles = proc.num_handles() if hasattr(proc, 'num_handles') else -1
+            log.info("health: rss=%.0fMB threads=%d handles=%d playing=%s",
+                     rss_mb, n_threads, handles, self.play_flag)
+        except Exception:
+            pass
+        self.after(600000, self._log_health)
 
     # ---- thread-safe UI marshaling --------------------------------------- #
     def post_ui(self, fn):
@@ -1260,7 +1528,8 @@ class App(tk.Tk):
             urls = list(self.url_entry['values'])
             if url and url not in urls:
                 urls.append(url)
-                self.url_entry['values'] = urls
+            urls = urls[-20:]   # bounded history: a years-old kiosk can't bloat it
+            self.url_entry['values'] = urls
             write_settings({
                 'url': url, 'urls': urls,
                 'divisions': self._safe_divisions(),
@@ -1474,6 +1743,15 @@ class App(tk.Tk):
                     self.post_ui(lambda: messagebox.showinfo("Updates", "Could not reach the update server."))
                 return
             if remote and remote != PROGRAM_VERSION:
+                if silent:
+                    # NEVER pop a modal on the quiet launch check: an unattended
+                    # kiosk has nobody to dismiss it, and a modal inside the UI
+                    # pump stalls every status update until it is closed.
+                    log.info("update available: %s (running %s)", remote, PROGRAM_VERSION)
+                    self.post_ui(lambda: self.update_status(
+                        "Update {} available - see Tools menu.".format(remote)))
+                    return
+
                 def offer():
                     if messagebox.askyesno(
                             "Update available",
@@ -1526,11 +1804,18 @@ class App(tk.Tk):
     def _safe_divisions(self):
         return clamp_divisions(self.divisions_spinbox.get())
 
-    def play_video(self):
+    def play_video(self, from_autoplay=False):
+        """Start playback. from_autoplay=True marks an UNATTENDED start (kiosk
+        autoplay / watchdog): those paths must never block on a modal error box
+        nobody is there to dismiss - they log, show the status bar, and retry."""
         self.stop_video()
         url = self.url_entry.get().strip()
         if not is_valid_stream_url(url):
-            messagebox.showerror("URL", "Please enter a valid http(s) video URL.")
+            if from_autoplay:
+                log.warning("autoplay: no valid URL configured")
+                self.update_status("No valid video URL configured.", color='#b06a00')
+            else:
+                messagebox.showerror("URL", "Please enter a valid http(s) video URL.")
             return
         divisions = self._safe_divisions()
         self._clamp_divisions_display()
@@ -1538,10 +1823,24 @@ class App(tk.Tk):
         self.player = Player(self, url, divisions)
         if not self.player.tools_ok:
             self.player = None
-            messagebox.showerror("Missing tools",
-                                 "yt-dlp, ffmpeg and ffplay must be on PATH (or next to the app).")
+            if from_autoplay:
+                # A kiosk boot race (bin folder on a slow disk/share, AV still
+                # scanning the exes) must retry, not park on an error forever.
+                log.warning("autoplay: yt-dlp/ffmpeg/ffplay not found yet; retrying in 30s")
+                self.update_status("Player tools not found - retrying in 30s...",
+                                   color='#b06a00')
+                self.after(30000, lambda: self.play_video(from_autoplay=True))
+            else:
+                messagebox.showerror(
+                    "Missing tools",
+                    "yt-dlp, ffmpeg and ffplay must be on PATH (or next to the app).")
             return
         self.play_flag = True
+        # While a show is wanted, the machine must not idle into sleep or blank
+        # the display (an unattended kiosk that slept "froze" for good - even
+        # the network recovery could not wake it). Restored on Stop/close; an
+        # explicit lid-close/power-button still wins, as it should.
+        winkiosk.keep_awake(True)
         self.play_button.config(state=tk.DISABLED)
         self.update_status("Starting...", color='#b06a00')
         self.player.fetch_title_async(lambda t: self.video_title_label.config(text=t))
@@ -1552,6 +1851,7 @@ class App(tk.Tk):
         if self.player:
             self.player.stop()
         self.play_flag = False
+        winkiosk.keep_awake(False)
         self.play_button.config(state=tk.NORMAL)
         self.update_status("Ready")
 
@@ -1562,6 +1862,7 @@ class App(tk.Tk):
         if player is not self.player:
             return
         self.play_flag = False
+        winkiosk.keep_awake(False)
         self.play_button.config(state=tk.NORMAL)
         self.update_status("Stopped.")
 
@@ -1608,6 +1909,7 @@ class App(tk.Tk):
             pass
         self.save_all_settings()
         self.play_flag = False
+        winkiosk.keep_awake(False)
         if self.player:
             # Block until every helper process is gone, so closing the window
             # never leaves an orphaned ffplay/yt-dlp running (the async Stop used
@@ -1619,6 +1921,15 @@ class App(tk.Tk):
 def main():
     _init_paths()
     add_to_path()
+    # DPI awareness must be set BEFORE the first window / monitor enumeration:
+    # with it, every coordinate in the app is a true physical pixel, so windows
+    # land exactly fullscreen even on mixed 125%/150% multi-monitor setups.
+    log.info("dpi awareness: %s", winkiosk.set_dpi_awareness())
+    # One kiosk, one instance: run-at-startup plus a manual double-click must
+    # not race two walls (double decode load + fullscreen fights = "freeze").
+    if not winkiosk.acquire_single_instance():
+        log.warning("another Video Tiler instance is already running; exiting")
+        return
     app = App()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()

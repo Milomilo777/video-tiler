@@ -187,10 +187,81 @@ def test_terminate_kills_download_first_then_joins():
     check("ffplay stdin closed during teardown", s1.close_count >= 1)
 
 
+def _fake_build(store):
+    """A _build_consumer stand-in that creates a fully working in-memory
+    consumer (FakeStdin + real writer thread) and records it in `store`."""
+    def build(self, mon, index, single, muted):
+        stdin = FakeStdin()
+        c = {'proc': FakeProc(stdin), 'q': queue.Queue(maxsize=self.FANOUT_QUEUE_MAX),
+             'mon': mon, 'index': index, 'single': single, 'muted': muted,
+             'dead': False, 'full_since': None, 'restarts': 0, 'first_restart': 0.0}
+        c['thread'] = threading.Thread(target=self._consumer_writer, args=(c,), daemon=True)
+        c['thread'].start()
+        store.append(c)
+        return c
+    return build
+
+
+def test_windows_spawn_only_after_first_data():
+    # The wall must NOT exist until real data arrives (a dead launch then costs
+    # zero windows - no black fullscreen flashes on every offline retry), and
+    # once the first chunk lands every spawned window gets the FULL stream.
+    p = _make_player()
+    built = []
+    orig_build = vt.Player._build_consumer
+    vt.Player._build_consumer = _fake_build(built)
+    try:
+        p.play_flag = True
+        p.ytdlp_process = FakeProc(None)          # download 'running'
+        mons = [{'index': i, 'x': 1920 * i, 'y': 0, 'width': 1920, 'height': 1080,
+                 'name': 'M%d' % i, 'is_primary': i == 0} for i in range(2)]
+        p._spawn_plan = {'targets': mons, 'single': False, 'muted': True}
+        stop = threading.Event()
+        p._fanout_stop = stop
+        check("no windows before any data arrived", p._consumers == [] and not built)
+
+        payload = b"".join(bytes([i % 256]) * 1000 for i in range(30))  # 30 KB
+        p._fanout(io.BytesIO(payload), stop)
+        for c in built:
+            c['thread'].join(3)
+        check("windows spawned on the first chunk (both monitors)",
+              p._windows_spawned is True and len(p._consumers) == 2)
+        check("every spawned window received the byte-exact full stream",
+              all(bytes(c['proc'].stdin.buf) == payload for c in built))
+        check("first-data flag feeds the stall watchdog thresholds",
+              p._got_first_data is True)
+    finally:
+        vt.Player._build_consumer = orig_build
+
+
+def test_no_spawn_after_stop_raced_in():
+    # A Stop that lands before the first byte must prevent the spawn entirely
+    # (nothing published, nothing leaked).
+    p = _make_player()
+    built = []
+    orig_build = vt.Player._build_consumer
+    vt.Player._build_consumer = _fake_build(built)
+    try:
+        p.play_flag = False                        # Stop already happened
+        p.ytdlp_process = FakeProc(None)
+        p._spawn_plan = {'targets': [{'index': 0, 'x': 0, 'y': 0, 'width': 1920,
+                                      'height': 1080, 'name': 'M', 'is_primary': True}],
+                         'single': True, 'muted': False}
+        stop = threading.Event()
+        p._fanout_stop = stop
+        p._fanout(io.BytesIO(b"x" * 70000), stop)
+        check("stopped player never spawned a window",
+              p._consumers == [] and p._windows_spawned is False)
+    finally:
+        vt.Player._build_consumer = orig_build
+
+
 if __name__ == '__main__':
     for fn in [test_fanout_copies_to_all_and_closes_dead_writer,
                test_fanout_retires_a_wedged_consumer_instead_of_blocking,
-               test_terminate_kills_download_first_then_joins]:
+               test_terminate_kills_download_first_then_joins,
+               test_windows_spawn_only_after_first_data,
+               test_no_spawn_after_stop_raced_in]:
         print(fn.__name__)
         fn()
     print()

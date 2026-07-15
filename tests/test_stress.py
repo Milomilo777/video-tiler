@@ -162,7 +162,8 @@ class _Sink:
 class FakePopen:
     _next = 4_000_000_000
 
-    def __init__(self, cmd, stdout=None, stderr=None, stdin=None, creationflags=0):
+    def __init__(self, cmd, stdout=None, stderr=None, stdin=None,
+                 creationflags=0, env=None):
         FakePopen._next += 1
         self.pid = FakePopen._next
         self._killed = False
@@ -212,13 +213,15 @@ def test_rapid_start_teardown_cycles_do_not_leak_threads():
     ]
 
     orig = (vt.find_executable, vt.subprocess.Popen, vt._kill_tree,
-            vt.monitor_utils.list_monitors)
+            vt.monitor_utils.list_monitors, vt.Player.ENFORCE_RECT)
     vt.find_executable = lambda name: name
     vt.subprocess.Popen = FakePopen
     vt._kill_tree = lambda proc: proc.kill() if hasattr(proc, 'kill') else None
     vt.monitor_utils.list_monitors = lambda: [dict(m) for m in fake_mons]
+    vt.Player.ENFORCE_RECT = False          # fake pids own no real windows
 
     errors = []
+    spawned = [0]
     try:
         p = vt.Player(App(), "http://x", 3)
         p.play_flag = True
@@ -226,7 +229,13 @@ def test_rapid_start_teardown_cycles_do_not_leak_threads():
         CYCLES = 25
         for _ in range(CYCLES):
             try:
-                p._start()                  # launches fake yt-dlp + 2 fake ffplay + threads
+                p._start()                  # launches fake yt-dlp; windows spawn
+                                            # on the first fanned-out chunk
+                deadline = time.time() + 5.0
+                while not p._windows_spawned and time.time() < deadline:
+                    time.sleep(0.005)       # wait for the deferred spawn
+                if p._windows_spawned and len(p._consumers) == 2:
+                    spawned[0] += 1
                 p._terminate(join=True)     # must join every per-cycle thread
             except Exception as e:          # pragma: no cover
                 errors.append(repr(e))
@@ -237,9 +246,11 @@ def test_rapid_start_teardown_cycles_do_not_leak_threads():
         leaked = threading.active_count() - baseline
     finally:
         (vt.find_executable, vt.subprocess.Popen, vt._kill_tree,
-         vt.monitor_utils.list_monitors) = orig
+         vt.monitor_utils.list_monitors, vt.Player.ENFORCE_RECT) = orig
 
     check("no exception across %d rapid start/teardown cycles" % CYCLES, not errors)
+    check("the deferred spawn produced the full wall every cycle (%d/%d)"
+          % (spawned[0], CYCLES), spawned[0] == CYCLES)
     check("worker threads do not accumulate (join=True really joins them); leaked=%d"
           % leaked, leaked <= 2)
 
