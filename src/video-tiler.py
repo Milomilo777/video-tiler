@@ -140,6 +140,27 @@ def find_executable(name):
     return None
 
 
+OFFLINE_VIDEO_FILENAME = 'offline.mp4'
+
+
+def find_offline_video():
+    """Path to the local fallback video played while the internet is down.
+    Checked next to the exe/script (same sibling-file convention as
+    yt-dlp.exe/ffmpeg.exe/ffplay.exe - where compile_windows.bat copies it for
+    a packaged build), then in the repo's assets/ folder (so a source run
+    finds it too). None if absent, in which case offline playback just falls
+    back to the blank probing wait it always had."""
+    candidates = [
+        os.path.dirname(os.path.abspath(sys.argv[0])),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets'),
+    ]
+    for base in candidates:
+        p = os.path.join(base, OFFLINE_VIDEO_FILENAME)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def is_valid_stream_url(url):
     """Only accept http(s) URLs. This guards yt-dlp against argument injection
     (a value starting with '-' would otherwise be read as an option such as
@@ -466,6 +487,10 @@ class Player:
     # the pipeline; this is how often. Cheap enough to keep small, so playback
     # resumes within ~half a minute of connectivity returning.
     OFFLINE_PROBE_INTERVAL = 30.0
+    # While a local fallback video is covering the wall (see find_offline_video),
+    # there's no rush - the screens aren't blank, so probe far less often to
+    # avoid burning cycles on a laptop that may be offline for hours.
+    OFFLINE_FALLBACK_PROBE_INTERVAL = 180.0
     # Measured CPU-overload learning (Auto quality only): if this many windows
     # were retired as wedged within one session, or a window relaunch-storm
     # escalated, the next session steps the Auto resolution down one rung.
@@ -571,6 +596,81 @@ class Player:
         #   machine that comfortably keeps up.
         return ([self.ffplay_path, '-threads', '0', '-', '-vf', vf, '-framedrop',
                  '-autoexit', '-loglevel', 'warning', '-hide_banner'] + audio + win)
+
+    def _fallback_ffplay_cmd(self, mon, single, muted, video_path):
+        """Same window placement/quality flags as the live tile, but reads the
+        local fallback file directly instead of the yt-dlp stdin pipe, and
+        loops it forever (-loop 0) so it keeps covering the wall for however
+        long the internet stays down."""
+        vf, _ow, _oh = monitor_utils.tile_filter_for(mon['width'], mon['height'], self.divisions)
+        win = (['-fs'] if self._uses_fs(mon, single)
+               else monitor_utils.window_opts_for(mon, mon['width'], mon['height']))
+        audio = ['-an'] if muted else []
+        return ([self.ffplay_path, '-loop', '0', video_path, '-vf', vf, '-framedrop',
+                 '-autoexit', '-loglevel', 'warning', '-hide_banner'] + audio + win)
+
+    def _build_fallback_consumer(self, mon, single, muted, video_path):
+        """Spawn one looping ffplay window playing the local fallback file.
+        Raises if ffplay cannot launch (caller decides how to degrade)."""
+        proc = subprocess.Popen(
+            self._fallback_ffplay_cmd(mon, single, muted, video_path),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
+            env=winkiosk.sdl_child_env())
+        if self.ENFORCE_RECT and not self._uses_fs(mon, single):
+            c = {'proc': proc, 'mon': mon}
+            self._enforce_rect_async(c)
+        return proc
+
+    def _play_offline_fallback(self, video_path):
+        """Cover every target monitor with the looping local fallback video
+        while the internet is down, waking up only to probe connectivity every
+        OFFLINE_FALLBACK_PROBE_INTERVAL. Returns True once the internet is back
+        (caller should reconnect), False if playback stopped instead (either a
+        Stop arrived, or the fallback windows themselves could not be spawned -
+        the caller degrades to the blank probing wait in that case)."""
+        targets, multi = self._targets()
+        muted = bool(getattr(self.app, 'opt_mute', False))
+        single = len(targets) <= 1
+        procs = []
+        try:
+            for i, mon in enumerate(targets):
+                procs.append(self._build_fallback_consumer(
+                    mon, single, muted or i > 0, video_path))
+        except Exception as e:
+            log.warning("could not start offline fallback video: %s", e)
+            for p in procs:
+                _kill_tree(p)
+            return False
+
+        log.info("no internet connectivity; playing local fallback video on "
+                 "%d window(s) - checking connectivity every ~%.0fs",
+                 len(procs), self.OFFLINE_FALLBACK_PROBE_INTERVAL)
+        self.app.post_ui(lambda: self.app.update_status(
+            "No internet connection - playing offline video until it returns...",
+            color='#b06a00'))
+        try:
+            online = False
+            while self.play_flag:
+                self._wait_backoff(jittered(self.OFFLINE_FALLBACK_PROBE_INTERVAL))
+                if not self.play_flag:
+                    break
+                # A fallback window that died on its own (rare) is relaunched in
+                # place so the wall never goes black while still waiting.
+                for i, p in enumerate(procs):
+                    if p.poll() is not None:
+                        try:
+                            procs[i] = self._build_fallback_consumer(
+                                targets[i], single, muted or i > 0, video_path)
+                        except Exception:
+                            pass
+                if internet_ok(self.url):
+                    online = True
+                    break
+            return online
+        finally:
+            for p in procs:
+                _kill_tree(p)
 
     # ---- process lifecycle ------------------------------------------------ #
     def _build_consumer(self, mon, index, single, muted):
@@ -1107,6 +1207,16 @@ class Player:
                 # no pointless yt-dlp self-updates), and playback resumes within
                 # one probe interval of the connection returning.
                 if not internet_ok(self.url):
+                    offline_video = find_offline_video()
+                    if offline_video:
+                        online = self._play_offline_fallback(offline_video)
+                        if not self.play_flag:
+                            break
+                        if online:
+                            log.info("connectivity restored; reconnecting now")
+                            continue
+                        # fallback windows themselves failed to spawn - degrade
+                        # to the blank probing wait below instead of tight-looping.
                     log.info("no internet connectivity (probe failed); probing "
                              "every ~%.0fs - nothing is spawned while offline",
                              self.OFFLINE_PROBE_INTERVAL)

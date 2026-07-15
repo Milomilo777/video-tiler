@@ -78,6 +78,17 @@ frame N² times, then tile) — done by `monitor_utils.tile_filter_for`.
   falls through to reconnect instead of killing the worker; a second outer
   guard makes even an "impossible" crash end the session cleanly (and the App
   watchdog restarts playback). Tool paths are re-resolved on every start.
+- **Offline fallback video.** If `find_offline_video()` finds `offline.mp4`
+  next to the exe/script (or in the repo's `assets/`), the connectivity gate
+  plays it on a **looping** (`-loop 0`), muted-per-window-policy `ffplay` per
+  target monitor instead of sitting on a blank wall — so passers-by see
+  content, not a dead screen, during an outage. Because the wall isn't blank,
+  there's no rush: connectivity is re-probed only every
+  `OFFLINE_FALLBACK_PROBE_INTERVAL` (~3 min, vs ~30 s for the blank-wait path).
+  A fallback window that dies on its own is relaunched in place. As soon as
+  `internet_ok` succeeds, every fallback window is killed and the normal
+  reconnect resumes. No `offline.mp4` present → falls straight back to the
+  original blank probing wait.
 - **Measured CPU-pressure quality step-down (Auto only).** Windows that
   repeatedly wedge (queue full → retired) or a relaunch storm are *evidence*
   this machine cannot decode the current resolution. Each such session bumps

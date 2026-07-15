@@ -388,6 +388,207 @@ def test_stream_host_and_jitter():
     check("jitter actually varies", len({round(v, 6) for v in vals}) > 1)
 
 
+# ---- offline fallback video ------------------------------------------------ #
+def test_find_offline_video_prefers_sibling_over_repo_assets():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        sib = os.path.join(d, vt.OFFLINE_VIDEO_FILENAME)
+        with open(sib, 'wb') as f:
+            f.write(b'x')
+        orig_argv0 = sys.argv[0]
+        sys.argv[0] = os.path.join(d, 'video-tiler.exe')
+        try:
+            check("a sibling copy next to the exe wins over the repo assets/ copy",
+                  vt.find_offline_video() == sib)
+        finally:
+            sys.argv[0] = orig_argv0
+
+
+def test_find_offline_video_falls_back_to_repo_assets():
+    orig_argv0 = sys.argv[0]
+    sys.argv[0] = os.path.join(os.path.dirname(__file__), 'no_such_dir_xyz', 'video-tiler.exe')
+    try:
+        p = vt.find_offline_video()
+        check("no sibling copy -> finds the repo's assets/offline.mp4",
+              p is not None and os.path.isfile(p)
+              and os.path.basename(p) == vt.OFFLINE_VIDEO_FILENAME)
+    finally:
+        sys.argv[0] = orig_argv0
+
+
+def test_find_offline_video_none_when_absent_everywhere():
+    orig_argv0 = sys.argv[0]
+    orig_name = vt.OFFLINE_VIDEO_FILENAME
+    sys.argv[0] = os.path.join(os.path.dirname(__file__), 'no_such_dir_xyz', 'video-tiler.exe')
+    vt.OFFLINE_VIDEO_FILENAME = 'this_file_does_not_exist_anywhere.mp4'
+    try:
+        check("no file anywhere -> None (degrades to the blank probing wait)",
+              vt.find_offline_video() is None)
+    finally:
+        sys.argv[0] = orig_argv0
+        vt.OFFLINE_VIDEO_FILENAME = orig_name
+
+
+def test_fallback_ffplay_cmd_loops_local_file():
+    p = vt.Player(FakeApp(), "u", 3)
+    single = p._fallback_ffplay_cmd(FAKE[1], True, True, "C:/x/offline.mp4")
+    check("loops the file forever (-loop 0)",
+          '-loop' in single and single[single.index('-loop') + 1] == '0')
+    check("reads the local file directly (not stdin)", "C:/x/offline.mp4" in single)
+    check("single window still uses -fs", '-fs' in single)
+    check("muted window gets -an", '-an' in single)
+    multi = p._fallback_ffplay_cmd(FAKE[0], False, False, "C:/x/offline.mp4")
+    check("multi window is placed, not -fs", '-fs' not in multi and '-noborder' in multi)
+    check("unmuted window keeps audio (no -an)", '-an' not in multi)
+
+
+class _MutedFalseApp(FakeApp):
+    def __init__(self):
+        super().__init__(multi=True)
+        self.opt_mute = False
+
+
+def test_play_offline_fallback_spawns_per_monitor_and_recovers():
+    # Fallback windows are built per target monitor (only the first keeps
+    # audio, same convention as the live wall), probed every
+    # OFFLINE_FALLBACK_PROBE_INTERVAL, and torn down once the internet is
+    # back - the caller is told to reconnect.
+    app = _MutedFalseApp()
+    p = vt.Player(app, "http://x", 3)
+    built, killed = [], []
+    orig_build, orig_kill, orig_internet = (
+        vt.Player._build_fallback_consumer, vt._kill_tree, vt.internet_ok)
+
+    def fake_build(self, mon, single, muted, video_path):
+        built.append((mon['index'], single, muted, video_path))
+        return _Live()
+    vt.Player._build_fallback_consumer = fake_build
+    vt._kill_tree = lambda proc: killed.append(proc)
+
+    online = {'v': False}
+    vt.internet_ok = lambda url, timeout=3.0: online['v']
+    waits = []
+
+    def fake_wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            online['v'] = True
+    p._wait_backoff = fake_wait
+    p.play_flag = True   # _play_offline_fallback is normally only called while playing
+
+    try:
+        result = p._play_offline_fallback("C:/x/offline.mp4")
+    finally:
+        vt.Player._build_fallback_consumer, vt._kill_tree, vt.internet_ok = (
+            orig_build, orig_kill, orig_internet)
+
+    check("one fallback window spawned per monitor", len(built) == 3)
+    check("only the first window kept audio", [b[2] for b in built] == [False, True, True])
+    check("every window got the fallback file path",
+          all(b[3] == "C:/x/offline.mp4" for b in built))
+    check("probes at ~OFFLINE_FALLBACK_PROBE_INTERVAL (3 min), not the fast 30s gate",
+          all(seconds >= vt.Player.OFFLINE_FALLBACK_PROBE_INTERVAL for seconds in waits))
+    check("returns True once online (caller reconnects)", result is True)
+    check("all fallback windows were torn down once online", len(killed) == 3)
+
+
+def test_play_offline_fallback_stops_cleanly_without_reconnecting():
+    app = _MutedFalseApp()
+    p = vt.Player(app, "http://x", 3)
+    killed = []
+    orig_build, orig_kill, orig_internet = (
+        vt.Player._build_fallback_consumer, vt._kill_tree, vt.internet_ok)
+    vt.Player._build_fallback_consumer = lambda self, mon, single, muted, video_path: _Live()
+    vt._kill_tree = lambda proc: killed.append(proc)
+    vt.internet_ok = lambda url, timeout=3.0: False   # net never returns
+
+    def fake_wait(seconds):
+        p.play_flag = False   # a Stop arrives while still offline
+    p._wait_backoff = fake_wait
+    p.play_flag = True
+
+    try:
+        result = p._play_offline_fallback("C:/x/offline.mp4")
+    finally:
+        vt.Player._build_fallback_consumer, vt._kill_tree, vt.internet_ok = (
+            orig_build, orig_kill, orig_internet)
+
+    check("returns False when stopped instead of reconnecting", result is False)
+    check("fallback windows are still torn down on stop", len(killed) == 3)
+
+
+def test_play_offline_fallback_degrades_when_spawn_fails():
+    # If ffplay itself can't launch the fallback file, the caller must fall
+    # back to the original blank probing wait rather than looping forever.
+    app = _MutedFalseApp()
+    p = vt.Player(app, "http://x", 3)
+    killed = []
+    orig_build, orig_kill = vt.Player._build_fallback_consumer, vt._kill_tree
+
+    def fake_build_fail(self, mon, single, muted, video_path):
+        raise RuntimeError("ffplay not found")
+    vt.Player._build_fallback_consumer = fake_build_fail
+    vt._kill_tree = lambda proc: killed.append(proc)
+    try:
+        result = p._play_offline_fallback("C:/x/offline.mp4")
+    finally:
+        vt.Player._build_fallback_consumer, vt._kill_tree = orig_build, orig_kill
+
+    check("returns False so the caller degrades to the blank-wait probe", result is False)
+    check("nothing was spawned, so nothing needed killing", killed == [])
+
+
+def test_run_uses_offline_fallback_video_when_present():
+    # Wiring test: run()'s connectivity gate must reach for the fallback video
+    # (if find_offline_video() found one) BEFORE showing the blank
+    # "waiting for it to return" status, and resume normal reconnection once
+    # the fallback path itself reports the internet is back.
+    app = FakeApp()
+    online = {'v': False}
+    vt.internet_ok = lambda url, timeout=3.0: online['v']
+    orig_find = vt.find_offline_video
+    vt.find_offline_video = lambda: "C:/x/offline.mp4"
+    p = vt.Player(app, "http://x", 3)
+    starts = [0]
+
+    def fake_start():
+        starts[0] += 1
+    p._start = fake_start
+    p._alive = lambda: False
+    p._terminate = lambda join=True: None
+    p._death_reason = lambda: "test"
+    fallback_calls = []
+
+    def fake_fallback(video_path):
+        fallback_calls.append(video_path)
+        online['v'] = True   # connectivity "returns" while the fallback played
+        return True
+    p._play_offline_fallback = fake_fallback
+    waits = [0]
+
+    def fake_wait(seconds):
+        waits[0] += 1
+        if waits[0] >= 5:
+            p.play_flag = False
+    p._wait_backoff = fake_wait
+
+    orig_sleep = vt.time.sleep
+    vt.time.sleep = lambda s: None
+    try:
+        p.run()
+    finally:
+        vt.time.sleep = orig_sleep
+        vt.find_offline_video = orig_find
+
+    check("the discovered fallback video was used",
+          fallback_calls == ["C:/x/offline.mp4"])
+    check("the blank 'waiting for it to return' status was never shown "
+          "(the fallback video covered the wall instead)",
+          not any('waiting for it to return' in m.lower() for m in app.status_msgs))
+    check("run() kept reconnecting after the fallback reported online",
+          starts[0] >= 2)
+
+
 def test_internet_ok_uses_tcp_probe():
     # NB: earlier run() tests stub vt.internet_ok, so probe the ORIGINAL.
     probe = _ORIG_INTERNET_OK
@@ -429,6 +630,14 @@ if __name__ == '__main__':
                test_run_offline_gate_spawns_nothing_and_recovers,
                test_select_format_cpu_pressure,
                test_placed_window_gets_exact_monitor_size,
+               test_find_offline_video_prefers_sibling_over_repo_assets,
+               test_find_offline_video_falls_back_to_repo_assets,
+               test_find_offline_video_none_when_absent_everywhere,
+               test_fallback_ffplay_cmd_loops_local_file,
+               test_play_offline_fallback_spawns_per_monitor_and_recovers,
+               test_play_offline_fallback_stops_cleanly_without_reconnecting,
+               test_play_offline_fallback_degrades_when_spawn_fails,
+               test_run_uses_offline_fallback_video_when_present,
                test_stream_host_and_jitter, test_internet_ok_uses_tcp_probe]:
         print(fn.__name__)
         fn()

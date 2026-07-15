@@ -36,6 +36,9 @@ hub). From a core i7, tiling can go up to 64×64 tiles.
     measurably cannot keep up (a manual quality choice is never overridden)
   * Single-instance guard: run-at-startup plus a double-click can't run two
     competing walls
+  * **Offline fallback video**: if `assets/offline.mp4` (or `offline.mp4` next
+    to the exe) is present, it plays on a loop across every monitor while the
+    internet is down instead of a blank wall, checked back only every ~3 min
 * Cross-platform code (Windows tested; macOS/Linux best-effort)
 
 ## Requirements
@@ -55,8 +58,17 @@ python src/video-tiler.py        # or double-click run.bat on Windows
 compile_windows.bat
 ```
 This installs the requirements + PyInstaller and produces a standalone `.exe`
-in `dist\` (icon: `src\img\app.ico`). Place `yt-dlp.exe`, `ffmpeg.exe` and
-`ffplay.exe` on `PATH` or next to the executable.
+in `dist\` (icon: `src\img\app.ico`), and copies `assets\offline.mp4` next to
+it. Place `yt-dlp.exe`, `ffmpeg.exe` and `ffplay.exe` on `PATH` or next to the
+executable.
+
+### Offline fallback video
+`assets/offline.mp4` is what plays, on a loop, while the internet is down (see
+Features above). This file's content is kept in sync by hand from Supreme
+Master TV's own feed:
+https://suprememastertv.com/en1/max/
+To change it, replace `assets/offline.mp4` with an updated export from that
+page and rebuild (or drop a new `offline.mp4` next to an already-built exe).
 
 ## macOS
 See [`platform/macos/`](platform/macos/) for the installer, a double-clickable

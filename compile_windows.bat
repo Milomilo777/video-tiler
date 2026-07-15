@@ -20,6 +20,10 @@ pyinstaller --clean --noconfirm --onefile --windowed ^
     --name "video-tiler" ^
     "src\video-tiler.py"
 
+REM 4. Copy the offline fallback video next to the exe (same sibling-file
+REM    convention as the yt-dlp/ffmpeg/ffplay binaries below).
+if exist "assets\offline.mp4" copy /Y "assets\offline.mp4" "dist\offline.mp4" >nul
+
 ECHO.
 ECHO Done. The executable is in the "dist" folder.
 ECHO Remember to place yt-dlp.exe, ffmpeg.exe and ffplay.exe on PATH or next to it.
