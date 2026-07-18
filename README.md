@@ -1,4 +1,10 @@
 # Video Tiler
+
+[![Latest release](https://img.shields.io/github/v/release/Milomilo777/video-tiler?label=release)](https://github.com/Milomilo777/video-tiler/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Milomilo777/video-tiler/total)](https://github.com/Milomilo777/video-tiler/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS*-lightgrey)](#macos)
+
 ## _A video tiler designed for www.suprememastertv.com_
 
 > **AI agents / new contributors:** read [`PROJECT_INDEX.md`](PROJECT_INDEX.md)
@@ -113,4 +119,25 @@ threading model, reconnect/self-heal, settings).
   engines despite containing none.
 
 ## Download Windows binaries
-https://1drv.ms/u/c/25c35a16b8db8a90/EdKeHDg5-cxHvJYThwMSF5EBTtZlF8aWVQVJhSDBnC0LGw?e=BVbqYh
+[**Latest release**](https://github.com/Milomilo777/video-tiler/releases/latest) —
+grab the all-in-one `.zip` (exe + ffmpeg + ffplay + yt-dlp + offline fallback
+video, nothing else to install) or the standalone `.exe` alone.
+
+Mirror: https://1drv.ms/u/c/25c35a16b8db8a90/EdKeHDg5-cxHvJYThwMSF5EBTtZlF8aWVQVJhSDBnC0LGw?e=BVbqYh
+
+## Contributing
+Bug reports and feature requests are welcome via
+[Issues](https://github.com/Milomilo777/video-tiler/issues) — templates guide
+you through the useful details (version, OS, log lines). Pull requests are
+welcome too; [`ARCHITECTURE.md`](ARCHITECTURE.md) and
+[`PROJECT_INDEX.md`](PROJECT_INDEX.md) are the fastest way to get oriented
+before changing the playback engine.
+
+## Acknowledgments
+* Original project concept and first version: the
+  [translation-robot](https://github.com/translation-robot) team, built for
+  Supreme Master TV's live stream.
+* The v1.2/v1.3 reliability rewrite (kiosk hardening, self-heal, offline
+  fallback) and this repo's documentation were built with
+  [Claude](https://claude.com/claude-code) (Anthropic) as an AI pair
+  programmer.

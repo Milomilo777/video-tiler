@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Download the latest release
+    url: https://github.com/Milomilo777/video-tiler/releases
+    about: Grab the all-in-one Windows zip before filing a bug — it may already be fixed.

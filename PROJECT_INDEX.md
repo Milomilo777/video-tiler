@@ -185,18 +185,24 @@ compile_windows.bat
 <!-- AUTO-INDEX:STRUCTURE:START -->
 ## Structure (auto-refreshed — do not hand-edit this block)
 
-- **Source files tracked:** 26
-- **Structure refreshed:** 2026-07-18T11:21:34
+- **Source files tracked:** 30
+- **Structure refreshed:** 2026-07-18T11:37:16
 - **Semantic sections last built:** 2026-07-18T11:21:34
-- **Drift since semantic build:** +0 added · ~0 changed · -0 removed
+- **Drift since semantic build:** +4 added · ~2 changed · -0 removed
+
+> ⚠️ **STALE** — the source tree changed a lot since the semantic sections were built. Re-run `/project-index` to regenerate purposes / gotchas / subsystem maps.
+>
+> Notable: `.github/ISSUE_TEMPLATE/bug_report.yml`, `.github/ISSUE_TEMPLATE/config.yml`, `.github/ISSUE_TEMPLATE/feature_request.yml`, `README.md`, `src/video-tiler.py`, `tools/index_refresh.py`
 
 | Top-level | Source files |
 |---|---|
 | `tests` | 12 |
 | `(root)` | 10 |
+| `.github` | 3 |
 | `src` | 3 |
 | `platform` | 1 |
+| `tools` | 1 |
 
-**By type:** `.py`×16  `.bat`×4  `.md`×3  `.txt`×2  `.spec`×1
+**By type:** `.py`×17  `.bat`×4  `.md`×3  `.yml`×3  `.txt`×2  `.spec`×1
 
 <!-- AUTO-INDEX:STRUCTURE:END -->
