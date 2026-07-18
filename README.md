@@ -123,8 +123,6 @@ threading model, reconnect/self-heal, settings).
 grab the all-in-one `.zip` (exe + ffmpeg + ffplay + yt-dlp + offline fallback
 video, nothing else to install) or the standalone `.exe` alone.
 
-Mirror: https://1drv.ms/u/c/25c35a16b8db8a90/EdKeHDg5-cxHvJYThwMSF5EBTtZlF8aWVQVJhSDBnC0LGw?e=BVbqYh
-
 ## Contributing
 Bug reports and feature requests are welcome via
 [Issues](https://github.com/Milomilo777/video-tiler/issues) — templates guide
