@@ -63,8 +63,7 @@ def _read_version(default="1.1"):
 APP_NAME = "videotiler"
 PROGRAM_VERSION = _read_version()
 PROGRAM_AUTHOR = "Bluesun"
-AUTHOR_EMAIL = "smtv.bot@gmail.com"
-AUTHOR_WEBSITE = "https://github.com/translation-robot/video-tiler"
+AUTHOR_WEBSITE = "https://github.com/Milomilo777/video-tiler"
 
 DEFAULT_URL = "https://www.youtube.com/watch?v=ZzWBpGwKoaI"
 WHY_TILING_URL = "https://suprememastertv.com/en1/v/245875177398.html"
@@ -82,7 +81,7 @@ THEME_CHOICES = ['Light', 'Dark']
 
 DEFAULT_SETTINGS = {
     'url': DEFAULT_URL,
-    'urls': [DEFAULT_URL, "https://x.com/i/broadcasts/1LyxBgjebwOKN"],
+    'urls': [DEFAULT_URL],
     'divisions': 3,
     'auto_restart': True,
     'multi_monitor': False,
@@ -2004,8 +2003,9 @@ class App(tk.Tk):
             "  Activity is logged to:\n  {log}\n\n"
             "PLATFORM\n"
             "  Tested on Windows; macOS/Linux supported on a best-effort basis.\n\n"
-            "Version: {v}\nEmail: {e}\nWebsite: {w}".format(
-                v=PROGRAM_VERSION, e=AUTHOR_EMAIL, w=AUTHOR_WEBSITE, log=LOG_FILE)))
+            "Version: {v}\nWebsite: {w}\n"
+            "Bugs / feature requests: {w}/issues".format(
+                v=PROGRAM_VERSION, w=AUTHOR_WEBSITE, log=LOG_FILE)))
 
     def on_closing(self):
         # Stop the self-rescheduling UI pump BEFORE destroy so its pending

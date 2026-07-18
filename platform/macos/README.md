@@ -26,7 +26,7 @@ Get the repo **via Terminal** (this matters for Gatekeeper - see below),
 then run the installer:
 
 ```bash
-git clone https://github.com/translation-robot/video-tiler.git
+git clone https://github.com/Milomilo777/video-tiler.git
 cd video-tiler
 bash platform/macos/install.command
 ```
