@@ -69,9 +69,9 @@ AUTHOR_WEBSITE = "https://github.com/translation-robot/video-tiler"
 DEFAULT_URL = "https://www.youtube.com/watch?v=ZzWBpGwKoaI"
 WHY_TILING_URL = "https://suprememastertv.com/en1/v/245875177398.html"
 SUPPORTED_WEB_SITES = "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md"
-SOURCE_CODE_GITHUB = "https://github.com/translation-robot/video-tiler"
-UPDATE_VERSION_URL = "https://raw.githubusercontent.com/translation-robot/video-tiler/master/VERSION"
-RELEASES_URL = "https://github.com/translation-robot/video-tiler/releases"
+SOURCE_CODE_GITHUB = "https://github.com/Milomilo777/video-tiler"
+UPDATE_VERSION_URL = "https://raw.githubusercontent.com/Milomilo777/video-tiler/master/VERSION"
+RELEASES_URL = "https://github.com/Milomilo777/video-tiler/releases"
 
 # Robust YouTube extraction: try several player clients so one breaking does not
 # break playback. Ignored by non-YouTube extractors, so it is safe to always pass.
