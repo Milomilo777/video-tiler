@@ -1,6 +1,10 @@
 # Video Tiler
 ## _A video tiler designed for www.suprememastertv.com_
 
+> **AI agents / new contributors:** read [`PROJECT_INDEX.md`](PROJECT_INDEX.md)
+> first — a one-page map of the repo (subsystems, entry points, gotchas) that
+> saves a full re-scan.
+
 ## _Why a video tiler?_
 Multiply the benefits of the Supreme Master TV live stream:
 https://suprememastertv.com/en1/v/245875177398.html
