@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\video-tiler.py'],
     pathex=[],
     binaries=[],
-    datas=[('src/img', 'img'), ('VERSION', '.')],
+    datas=[('src\\img', 'img'), ('VERSION', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -23,7 +23,6 @@ exe = EXE(
     a.datas,
     [],
     name='video-tiler',
-    version='version_info.txt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -36,5 +35,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='version_info.txt',
     icon=['src\\img\\app.ico'],
 )
